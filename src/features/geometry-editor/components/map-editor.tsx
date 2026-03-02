@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useRef, useEffect, useCallback, useState } from "react";
+import React, { useRef, useEffect, useCallback, useState, useMemo } from "react";
 import maplibregl, { Map as MaplibreMap, type LngLatLike } from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import "@mapbox/mapbox-gl-draw/dist/mapbox-gl-draw.css";
@@ -22,6 +22,10 @@ import {
   MEASUREMENT_LINE_LAYER,
   MEASUREMENT_FILL_LAYER,
   MEASUREMENT_POINT_LAYER,
+  MULTI_DRAW_SOURCE_ID,
+  MULTI_DRAW_FILL_LAYER,
+  MULTI_DRAW_LINE_LAYER,
+  MULTI_DRAW_POINT_LAYER,
   LAYER_CONFIG,
 } from "../constants";
 import type {
@@ -32,7 +36,43 @@ import type {
   ParkLayer,
 } from "../types";
 import { useMapDraw } from "../hooks/use-map-draw";
+import { useVertexEdit } from "../hooks/use-vertex-edit";
+import { useContinueDrawing } from "../hooks/use-continue-drawing";
 import type { EditorActions } from "../hooks/use-editor-state";
+import {
+  VERTEX_EDIT_VERTEX_LAYER,
+  VERTEX_EDIT_SELECTED_VERTEX_LAYER,
+  VERTEX_EDIT_MIDPOINT_LAYER,
+} from "../constants";
+import { clipPolygon } from "../lib/geometry-ops";
+import type { Feature, LineString, Polygon as GeoPolygon, Position } from "geojson";
+import { toast } from "sonner";
+import { booleanPointInPolygon, point as turfPoint, polygon as turfPolygon } from "@turf/turf";
+
+// ─── Point-to-segment distance (for MultiLineString part detection) ──
+/** Approximate squared distance from a point to a line segment in lng/lat space. */
+function pointToSegmentDistance(
+  p: [number, number],
+  a: [number, number],
+  b: [number, number]
+): number {
+  const dx = b[0] - a[0];
+  const dy = b[1] - a[1];
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) {
+    // a and b are the same point
+    const ex = p[0] - a[0];
+    const ey = p[1] - a[1];
+    return Math.sqrt(ex * ex + ey * ey);
+  }
+  let t = ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const projX = a[0] + t * dx;
+  const projY = a[1] + t * dy;
+  const ex = p[0] - projX;
+  const ey = p[1] - projY;
+  return Math.sqrt(ex * ex + ey * ey);
+}
 
 // ─── Geometry translation helper ──────────────────────────────
 function translateCoordinates(
@@ -78,6 +118,9 @@ interface MapEditorProps {
   snappingEnabled: boolean;
   editor: EditorActions;
   onMapReady: (map: MaplibreMap) => void;
+  splitTargetId?: string | null;
+  /** Ref that MapEditor populates with a getter for the selected vertex in vertex edit mode. */
+  getSelectedVertexRef?: React.MutableRefObject<(() => { ringIndex: number; vertexIndex: number } | null) | null>;
 }
 
 export function MapEditor({
@@ -89,10 +132,19 @@ export function MapEditor({
   snappingEnabled,
   editor,
   onMapReady,
+  splitTargetId,
+  getSelectedVertexRef,
 }: MapEditorProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MaplibreMap | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
+
+  // Split mode: ID of polygon being split
+  const splitTargetIdRef = useRef<string | null>(null);
+  splitTargetIdRef.current = splitTargetId ?? null;
+  // Keep a ref to activeTool so callbacks can read the latest value
+  const activeToolRef = useRef(activeTool);
+  activeToolRef.current = activeTool;
 
   // Drag-to-move state
   const dragStateRef = useRef<{
@@ -145,12 +197,93 @@ export function MapEditor({
       // Record creation time so the click handler can ignore the
       // finishing double-click that would otherwise deselect the feature.
       justCreatedFeatureRef.current = Date.now();
+
+      // ── Clip mode interception ──
+      if (activeToolRef.current === "draw_clip_polygon") {
+        const targetId = splitTargetIdRef.current;
+        splitTargetIdRef.current = null;
+
+        if (targetId && feature.geometry.type === "Polygon") {
+          const targetFeature = features.features.find((f) => f.id === targetId);
+          if (
+            targetFeature &&
+            (targetFeature.geometry.type === "Polygon" ||
+              targetFeature.geometry.type === "MultiPolygon")
+          ) {
+            const cutter: Feature<GeoPolygon> = {
+              type: "Feature",
+              geometry: feature.geometry as GeoPolygon,
+              properties: {},
+            };
+            const result = clipPolygon(targetFeature, cutter);
+            if (result) {
+              editor.updateFeature(result);
+              editor.setTool("select");
+              toast.success("クリップ完了", {
+                description: "ポリゴンのジオメトリを更新しました",
+              });
+              return;
+            } else {
+              toast.error("クリップに失敗しました", {
+                description:
+                  "クリップ領域がポリゴンと重なっていることを確認してください",
+              });
+            }
+          }
+        }
+        // Fall back to select mode on failure
+        editor.setTool("select");
+        return;
+      }
+
+      // ── Multi-part drawing: Line ──
+      if (activeToolRef.current === "draw_line" && feature.geometry.type === "LineString") {
+        const lineCoords = (feature.geometry as LineString).coordinates;
+        editor.appendDrawingPart("line", lineCoords);
+        // Briefly switch to select so MapboxDraw goes to simple_select,
+        // preventing the double-click from bleeding into the next draw.
+        // Then re-enter draw mode after the double-click event has settled.
+        editor.setTool("select");
+        setTimeout(() => {
+          editor.setTool("draw_line");
+        }, 300);
+        toast.info("パートを追加しました", {
+          description: "続けて次のラインを描画、または Enter / 完了ボタンで確定",
+          duration: 2000,
+        });
+        return;
+      }
+
+      // ── Multi-part drawing: Polygon ──
+      if (activeToolRef.current === "draw_polygon" && feature.geometry.type === "Polygon") {
+        const polyCoords = (feature.geometry as GeoPolygon).coordinates;
+        editor.appendDrawingPart("polygon", polyCoords);
+        // Briefly switch to select so MapboxDraw goes to simple_select,
+        // preventing the double-click from bleeding into the next draw.
+        // Then re-enter draw mode after the double-click event has settled.
+        editor.setTool("select");
+        setTimeout(() => {
+          editor.setTool("draw_polygon");
+        }, 300);
+        toast.info("パートを追加しました", {
+          description: "続けて次のポリゴンを描画、または Enter / 完了ボタンで確定",
+          duration: 2000,
+        });
+        return;
+      }
+
+      // ── Single-part creation (Point or other) ──
       editor.addFeature(feature);
       editor.selectFeatures([feature.id]);
       editor.setRightPanel(true);
-      editor.setTool("select");
+
+      // Keep point tool active for continuous placement;
+      // MapboxDraw re-entry is handled in use-map-draw.ts
+      if (activeToolRef.current !== "draw_point") {
+        editor.setTool("select");
+      }
     },
-    [editor]
+    [editor, features.features]
   );
 
   const handleFeatureUpdated = useCallback(
@@ -174,7 +307,7 @@ export function MapEditor({
     [editor]
   );
 
-  const { loadFeatureForEditing, trashLastVertex } = useMapDraw({
+  const { loadFeatureForEditing, trashLastVertex, suppressNextCreateRef } = useMapDraw({
     map: mapRef.current,
     activeTool,
     onFeatureCreated: handleFeatureCreated,
@@ -183,6 +316,51 @@ export function MapEditor({
     onDrawingStateChanged: handleDrawingStateChanged,
     getExistingFeature,
     defaultLayer: "draft",
+  });
+
+  // ─── Vertex edit integration ────────────────────────────────
+  const vertexEditFeature = useMemo(() => {
+    const id = editor.state.vertexEditFeatureId;
+    if (!id) return null;
+    return features.features.find((f) => f.id === id) ?? null;
+  }, [editor.state.vertexEditFeatureId, features.features]);
+
+  const { getSelectedVertex } = useVertexEdit({
+    map: mapRef.current,
+    mapLoaded,
+    feature: vertexEditFeature,
+    partIndex: editor.state.vertexEditPartIndex ?? null,
+    allFeatures: features,
+    snappingEnabled,
+    onUpdateFeature: handleFeatureUpdated,
+    onExit: editor.exitVertexEdit,
+  });
+
+  // Expose getSelectedVertex to the parent via a ref
+  useEffect(() => {
+    if (getSelectedVertexRef) {
+      getSelectedVertexRef.current = getSelectedVertex;
+    }
+  }, [getSelectedVertex, getSelectedVertexRef]);
+
+  // ─── Continue drawing integration ─────────────────────────
+  const continueDrawingFeature = useMemo(() => {
+    const cds = editor.state.continueDrawingState;
+    if (!cds) return null;
+    return features.features.find((f) => f.id === cds.featureId) ?? null;
+  }, [editor.state.continueDrawingState, features.features]);
+
+  useContinueDrawing({
+    map: mapRef.current,
+    mapLoaded,
+    continueDrawingState: editor.state.continueDrawingState,
+    feature: continueDrawingFeature,
+    allFeatures: features,
+    snappingEnabled,
+    onAddVertex: editor.addContinueVertex,
+    onUndoVertex: editor.undoContinueVertex,
+    onFinish: editor.finishContinueDrawing,
+    onCancel: editor.cancelContinueDrawing,
   });
 
   // ─── Setup GeoJSON source and layers ──────────────────────
@@ -207,8 +385,8 @@ export function MapEditor({
           "fill-color": [
             "match",
             ["get", "layer"],
-            "park_boundaries", LAYER_CONFIG.park_boundaries.color,
-            "assets", LAYER_CONFIG.assets.color,
+            "park", LAYER_CONFIG.park.color,
+            "facilities", LAYER_CONFIG.facilities.color,
             "draft", LAYER_CONFIG.draft.color,
             LAYER_CONFIG.draft.color,
           ],
@@ -226,8 +404,8 @@ export function MapEditor({
           "line-color": [
             "match",
             ["get", "layer"],
-            "park_boundaries", LAYER_CONFIG.park_boundaries.color,
-            "assets", LAYER_CONFIG.assets.color,
+            "park", LAYER_CONFIG.park.color,
+            "facilities", LAYER_CONFIG.facilities.color,
             "draft", LAYER_CONFIG.draft.color,
             LAYER_CONFIG.draft.color,
           ],
@@ -251,8 +429,8 @@ export function MapEditor({
           "line-color": [
             "match",
             ["get", "layer"],
-            "park_boundaries", LAYER_CONFIG.park_boundaries.color,
-            "assets", LAYER_CONFIG.assets.color,
+            "park", LAYER_CONFIG.park.color,
+            "facilities", LAYER_CONFIG.facilities.color,
             "draft", LAYER_CONFIG.draft.color,
             LAYER_CONFIG.draft.color,
           ],
@@ -275,8 +453,8 @@ export function MapEditor({
           "circle-color": [
             "match",
             ["get", "layer"],
-            "park_boundaries", LAYER_CONFIG.park_boundaries.color,
-            "assets", LAYER_CONFIG.assets.color,
+            "park", LAYER_CONFIG.park.color,
+            "facilities", LAYER_CONFIG.facilities.color,
             "draft", LAYER_CONFIG.draft.color,
             LAYER_CONFIG.draft.color,
           ],
@@ -298,7 +476,12 @@ export function MapEditor({
         ],
         layout: {
           "text-field": ["get", "label"],
-          "text-size": ["coalesce", ["get", "size"], 14],
+          "text-size": [
+            "match", ["get", "layer"],
+            "park", ["coalesce", ["get", "size"], 18],
+            "facilities", ["coalesce", ["get", "size"], 12],
+            ["coalesce", ["get", "size"], 14],
+          ],
           "text-anchor": "center",
           "text-allow-overlap": true,
         },
@@ -322,7 +505,12 @@ export function MapEditor({
         ],
         layout: {
           "text-field": ["get", "label"],
-          "text-size": 12,
+          "text-size": [
+            "match", ["get", "layer"],
+            "park", 14,
+            "facilities", 11,
+            11,
+          ],
           "symbol-placement": "line-center",
           "text-allow-overlap": false,
           "text-anchor": "center",
@@ -348,7 +536,12 @@ export function MapEditor({
         ],
         layout: {
           "text-field": ["get", "label"],
-          "text-size": 12,
+          "text-size": [
+            "match", ["get", "layer"],
+            "park", 16,
+            "facilities", 12,
+            12,
+          ],
           "symbol-placement": "point",
           "text-allow-overlap": false,
           "text-anchor": "center",
@@ -437,6 +630,50 @@ export function MapEditor({
           "circle-radius": 5,
           "circle-color": "#f59e0b",
           "circle-stroke-width": 2,
+          "circle-stroke-color": "#ffffff",
+        },
+      });
+    }
+
+    // Add multi-draw preview source (shows accumulated parts during multi-part drawing)
+    if (!map.getSource(MULTI_DRAW_SOURCE_ID)) {
+      map.addSource(MULTI_DRAW_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+
+      map.addLayer({
+        id: MULTI_DRAW_FILL_LAYER,
+        type: "fill",
+        source: MULTI_DRAW_SOURCE_ID,
+        filter: ["==", ["geometry-type"], "Polygon"],
+        paint: {
+          "fill-color": "#4a7c59",
+          "fill-opacity": 0.2,
+        },
+      });
+
+      map.addLayer({
+        id: MULTI_DRAW_LINE_LAYER,
+        type: "line",
+        source: MULTI_DRAW_SOURCE_ID,
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          "line-color": "#4a7c59",
+          "line-width": 2.5,
+          "line-dasharray": [4, 3],
+        },
+      });
+
+      map.addLayer({
+        id: MULTI_DRAW_POINT_LAYER,
+        type: "circle",
+        source: MULTI_DRAW_SOURCE_ID,
+        filter: ["==", ["geometry-type"], "Point"],
+        paint: {
+          "circle-radius": 4,
+          "circle-color": "#4a7c59",
+          "circle-stroke-width": 1.5,
           "circle-stroke-color": "#ffffff",
         },
       });
@@ -539,6 +776,57 @@ export function MapEditor({
     source.setData({ type: "FeatureCollection", features });
   }, [measurementState, mapLoaded]);
 
+  // ─── Update multi-draw preview when drawing parts change ───
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapLoaded) return;
+
+    const source = map.getSource(MULTI_DRAW_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
+
+    const { drawingParts, drawingPartsType } = editor.state;
+
+    if (!drawingParts || !drawingPartsType || drawingParts.length === 0) {
+      source.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+
+    const previewFeatures: GeoJSON.Feature[] = [];
+
+    if (drawingPartsType === "line") {
+      const lineParts = drawingParts as Position[][];
+      for (const part of lineParts) {
+        previewFeatures.push({
+          type: "Feature",
+          geometry: { type: "LineString", coordinates: part },
+          properties: {},
+        });
+        // Add vertex markers at each endpoint
+        previewFeatures.push({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: part[0] },
+          properties: {},
+        });
+        previewFeatures.push({
+          type: "Feature",
+          geometry: { type: "Point", coordinates: part[part.length - 1] },
+          properties: {},
+        });
+      }
+    } else {
+      const polygonParts = drawingParts as Position[][][];
+      for (const part of polygonParts) {
+        previewFeatures.push({
+          type: "Feature",
+          geometry: { type: "Polygon", coordinates: part },
+          properties: {},
+        });
+      }
+    }
+
+    source.setData({ type: "FeatureCollection", features: previewFeatures });
+  }, [editor.state.drawingParts, editor.state.drawingPartsType, mapLoaded]);
+
   // ─── Mouse move handler for cursor coords ─────────────────
   useEffect(() => {
     const map = mapRef.current;
@@ -560,6 +848,9 @@ export function MapEditor({
     if (!map || !mapLoaded) return;
 
     const handleClick = (e: maplibregl.MapMouseEvent) => {
+      // Skip click if in continue drawing mode — that hook manages its own clicks
+      if (activeTool === "continue_drawing") return;
+
       // Skip click if we just finished a drag
       if (justDraggedRef.current) return;
 
@@ -591,6 +882,61 @@ export function MapEditor({
 
       // Handle coordinate input
       if (activeTool === "coordinate_input") return;
+
+      // In vertex edit mode, clicking empty space (not on vertex/midpoint handles)
+      // exits vertex edit. The vertex edit hook handles clicks on its own handles.
+      if (activeTool === "vertex_edit") {
+        const map = mapRef.current;
+        if (map) {
+          const vertexHits = map.queryRenderedFeatures(e.point, {
+            layers: [
+              VERTEX_EDIT_VERTEX_LAYER,
+              VERTEX_EDIT_SELECTED_VERTEX_LAYER,
+              VERTEX_EDIT_MIDPOINT_LAYER,
+            ].filter((layerId) => {
+              try { return !!map.getLayer(layerId); } catch { return false; }
+            }),
+          });
+          // If no vertex/midpoint hit, exit vertex edit
+          if (vertexHits.length === 0) {
+            editor.exitVertexEdit();
+          }
+        }
+        return;
+      }
+
+      // Shift+click multi-select while in draw_point mode
+      if (activeTool === "draw_point" && e.originalEvent.shiftKey) {
+        const queryLayers = [
+          POLYGON_FILL_LAYER,
+          LINE_LAYER,
+          POINT_LAYER,
+          TEXT_LAYER,
+        ];
+        const hitFeatures = map.queryRenderedFeatures(e.point, {
+          layers: queryLayers,
+        });
+        if (hitFeatures.length > 0) {
+          const featureId = hitFeatures[0].properties?.id;
+          if (featureId) {
+            // Suppress the point that MapboxDraw will create from this click
+            suppressNextCreateRef.current = true;
+            // Toggle feature in/out of selection
+            const currentIds = [...selectedFeatureIds];
+            const idx = currentIds.indexOf(featureId);
+            if (idx >= 0) {
+              currentIds.splice(idx, 1);
+            } else {
+              currentIds.push(featureId);
+            }
+            editor.selectFeatures(currentIds);
+            return;
+          }
+        }
+        // No feature under cursor with shift held — let MapboxDraw
+        // place a point as normal (fall through).
+        return;
+      }
 
       // Feature selection (only in select mode)
       if (activeTool !== "select") return;
@@ -640,6 +986,79 @@ export function MapEditor({
     editor,
   ]);
 
+  // ─── Double-click handler for vertex edit ───────────────────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapLoaded) return;
+
+    const handleDblClick = (e: maplibregl.MapMouseEvent) => {
+      // Only enter vertex edit from select mode
+      if (activeTool !== "select") return;
+
+      // Check if we double-clicked on a polygon or line
+      const queryLayers = [POLYGON_FILL_LAYER, LINE_LAYER];
+      const hitFeatures = map.queryRenderedFeatures(e.point, {
+        layers: queryLayers,
+      });
+
+      if (hitFeatures.length > 0) {
+        const featureId = hitFeatures[0].properties?.id;
+        if (featureId) {
+          const parkFeature = features.features.find((f) => f.id === featureId);
+          if (!parkFeature) return;
+
+          const geomType = parkFeature.geometry.type;
+
+          if (geomType === "Polygon" || geomType === "LineString") {
+            e.preventDefault();
+            editor.enterVertexEdit(featureId);
+          } else if (geomType === "MultiPolygon") {
+            e.preventDefault();
+            // Determine which part was clicked using point-in-polygon test
+            const clickPoint = turfPoint([e.lngLat.lng, e.lngLat.lat]);
+            const parts = parkFeature.geometry.coordinates as Position[][][];
+            let clickedPartIndex = 0; // Default to first part
+            for (let i = 0; i < parts.length; i++) {
+              try {
+                const poly = turfPolygon(parts[i]);
+                if (booleanPointInPolygon(clickPoint, poly)) {
+                  clickedPartIndex = i;
+                  break;
+                }
+              } catch {
+                // Invalid polygon part, skip
+              }
+            }
+            editor.enterVertexEdit(featureId, clickedPartIndex);
+          } else if (geomType === "MultiLineString") {
+            e.preventDefault();
+            // Determine which part was clicked by finding nearest line part
+            const clickLngLat: [number, number] = [e.lngLat.lng, e.lngLat.lat];
+            const parts = parkFeature.geometry.coordinates as Position[][];
+            let closestPartIndex = 0;
+            let closestDist = Infinity;
+            for (let i = 0; i < parts.length; i++) {
+              const line = parts[i];
+              for (let j = 0; j < line.length - 1; j++) {
+                const dist = pointToSegmentDistance(clickLngLat, line[j] as [number, number], line[j + 1] as [number, number]);
+                if (dist < closestDist) {
+                  closestDist = dist;
+                  closestPartIndex = i;
+                }
+              }
+            }
+            editor.enterVertexEdit(featureId, closestPartIndex);
+          }
+        }
+      }
+    };
+
+    map.on("dblclick", handleDblClick);
+    return () => {
+      map.off("dblclick", handleDblClick);
+    };
+  }, [mapLoaded, activeTool, features.features, editor]);
+
   // ─── Cursor style based on tool ───────────────────────────
   useEffect(() => {
     const map = mapRef.current;
@@ -653,6 +1072,7 @@ export function MapEditor({
         break;
       case "draw_line":
       case "draw_polygon":
+      case "draw_clip_polygon":
       case "measure_distance":
       case "measure_area":
         canvas.style.cursor = "crosshair";
@@ -663,11 +1083,32 @@ export function MapEditor({
       case "move":
         canvas.style.cursor = "move";
         break;
+      case "vertex_edit":
+      case "continue_drawing":
+        canvas.style.cursor = "crosshair";
+        break;
       default:
         canvas.style.cursor = "";
         break;
     }
   }, [activeTool]);
+
+  // ─── Expand selection to include park children for moves ────
+  const effectiveMoveIds = useMemo(() => {
+    const ids = new Set(selectedFeatureIds);
+    for (const id of selectedFeatureIds) {
+      const f = features.features.find((feat) => feat.id === id);
+      // If this is a park-defining feature, include all its children
+      if (f?.properties.layer === "park" && !f.properties.parkId) {
+        for (const child of features.features) {
+          if (child.properties.parkId === id) {
+            ids.add(child.id);
+          }
+        }
+      }
+    }
+    return ids;
+  }, [selectedFeatureIds, features.features]);
 
   // ─── Drag-to-move selected features ─────────────────────────
   useEffect(() => {
@@ -682,7 +1123,7 @@ export function MapEditor({
     ];
 
     const handleMouseDown = (e: maplibregl.MapMouseEvent) => {
-      // Only in select mode with a selection
+      // Only in select mode with a selection (not during vertex edit)
       if (activeTool !== "select" || selectedFeatureIds.length === 0) return;
 
       // Check if clicking on a selected feature
@@ -738,12 +1179,12 @@ export function MapEditor({
       const deltaLng = e.lngLat.lng - drag.startLngLat[0];
       const deltaLat = e.lngLat.lat - drag.startLngLat[1];
 
-      // Move all selected features by the delta (live preview)
+      // Move all selected features + park children by the delta (live preview)
       // Update the source data directly for smooth visual feedback
       const source = map.getSource(SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
       if (source) {
         const updatedFeatures = visibleFeatures.features.map((f) => {
-          if (selectedFeatureIds.includes(f.id)) {
+          if (effectiveMoveIds.has(f.id)) {
             const originalFromState = features.features.find((of) => of.id === f.id);
             if (originalFromState) {
               const moved = translateFeatureGeometry(originalFromState, deltaLng, deltaLat);
@@ -783,8 +1224,8 @@ export function MapEditor({
       // Only commit if actually moved
       const didMove = Math.abs(deltaLng) > 0.0000001 || Math.abs(deltaLat) > 0.0000001;
       if (didMove) {
-        // Update all selected features with final positions
-        for (const fId of selectedFeatureIds) {
+        // Update all selected features + park children with final positions
+        for (const fId of effectiveMoveIds) {
           const original = features.features.find((f) => f.id === fId);
           if (original) {
             const moved = translateFeatureGeometry(original, deltaLng, deltaLat);
@@ -808,7 +1249,7 @@ export function MapEditor({
       map.off("mousemove", handleMouseMove);
       map.off("mouseup", handleMouseUp);
     };
-  }, [mapLoaded, activeTool, selectedFeatureIds, features, visibleFeatures, editor]);
+  }, [mapLoaded, activeTool, selectedFeatureIds, effectiveMoveIds, features, visibleFeatures, editor]);
 
   // ─── Keyboard shortcuts ───────────────────────────────────
   useEffect(() => {
@@ -821,6 +1262,11 @@ export function MapEditor({
         return;
       }
 
+      // Skip all handling if in continue drawing mode — that hook manages its own keys
+      if (editor.state.continueDrawingState) {
+        return;
+      }
+
       // Backspace: remove last vertex during drawing
       if (e.key === "Backspace" && editor.state.isDrawing) {
         e.preventDefault();
@@ -828,9 +1274,22 @@ export function MapEditor({
         return;
       }
 
-      // Escape: cancel draw / deselect
+      // Enter: finish multi-part drawing
+      if (e.key === "Enter" && editor.state.drawingParts && editor.state.drawingParts.length > 0) {
+        e.preventDefault();
+        editor.finishMultiDrawing();
+        return;
+      }
+
+      // Escape: cancel vertex edit / multi-draw / draw / deselect
       if (e.key === "Escape") {
-        if (editor.state.isDrawing) {
+        if (editor.state.vertexEditFeatureId) {
+          editor.exitVertexEdit();
+        } else if (editor.state.drawingParts && editor.state.drawingParts.length > 0) {
+          // If we have accumulated parts, finalize them (don't discard work)
+          editor.finishMultiDrawing();
+        } else if (editor.state.isDrawing) {
+          editor.clearDrawingParts();
           editor.setTool("select");
         } else if (measurementState) {
           editor.setMeasurementState(null);
@@ -842,8 +1301,8 @@ export function MapEditor({
         return;
       }
 
-      // Delete: delete selected
-      if (e.key === "Delete" && selectedFeatureIds.length > 0) {
+      // Delete: delete selected (but not during vertex edit — vertex edit hook handles its own deletion)
+      if (e.key === "Delete" && selectedFeatureIds.length > 0 && !editor.state.vertexEditFeatureId) {
         e.preventDefault();
         editor.deleteSelected();
         return;

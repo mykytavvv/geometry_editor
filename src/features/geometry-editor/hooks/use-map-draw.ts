@@ -82,6 +82,12 @@ export function useMapDraw({
   const drawRef = useRef<MapboxDraw | null>(null);
   const isInitializedRef = useRef(false);
   const justCreatedAtRef = useRef(0);
+  const activeToolRef = useRef(activeTool);
+  activeToolRef.current = activeTool;
+  // When set to true, the next draw.create event will be suppressed
+  // (the created feature is deleted from draw but not added to state).
+  // Used to prevent point placement when shift+clicking for multi-select.
+  const suppressNextCreateRef = useRef(false);
 
   // Initialize MapboxDraw
   useEffect(() => {
@@ -121,6 +127,24 @@ export function useMapDraw({
       const draw = drawRef.current;
       if (!draw) return;
 
+      // If creation was suppressed (e.g. shift+click for multi-select in
+      // draw_point mode), just delete the feature from draw and bail out.
+      if (suppressNextCreateRef.current) {
+        suppressNextCreateRef.current = false;
+        for (const drawFeature of e.features) {
+          try {
+            if (drawFeature.id) draw.delete(String(drawFeature.id));
+          } catch { /* ignore */ }
+        }
+        // Re-enter draw_point so the user can keep placing points
+        if (activeToolRef.current === "draw_point") {
+          setTimeout(() => {
+            try { draw.changeMode("draw_point"); } catch { /* ignore */ }
+          }, 50);
+        }
+        return;
+      }
+
       // Record creation time so we can ignore draw.selectionchange events
       // that MapboxDraw fires when switching to simple_select after creation.
       justCreatedAtRef.current = Date.now();
@@ -150,6 +174,20 @@ export function useMapDraw({
           }
         } catch {
           // Ignore
+        }
+
+        // Re-enter draw_point mode for continuous point placement.
+        // MapboxDraw auto-exits to simple_select after placing a point.
+        if (featureType === "point" && activeToolRef.current === "draw_point") {
+          setTimeout(() => {
+            if (draw && activeToolRef.current === "draw_point") {
+              try {
+                draw.changeMode("draw_point");
+              } catch {
+                // Ignore if mode change fails
+              }
+            }
+          }, 50);
         }
       }
     };
@@ -230,12 +268,14 @@ export function useMapDraw({
         draw.changeMode("draw_line_string");
         break;
       case "draw_polygon":
+      case "draw_clip_polygon":
         draw.changeMode("draw_polygon");
         break;
       case "select":
       case "pan":
       case "move":
       case "vertex_edit":
+      case "continue_drawing":
       case "measure_distance":
       case "measure_area":
       case "coordinate_input":
@@ -307,6 +347,17 @@ export function useMapDraw({
     }
   }, []);
 
+  // Re-enter the current draw mode (used for multi-part drawing)
+  const reenterDrawMode = useCallback((mode: "draw_line_string" | "draw_polygon") => {
+    const draw = drawRef.current;
+    if (!draw) return;
+    try {
+      draw.changeMode(mode);
+    } catch {
+      // Ignore if mode change fails
+    }
+  }, []);
+
   // Get draw instance for external use
   const getDraw = useCallback(() => drawRef.current, []);
 
@@ -316,5 +367,7 @@ export function useMapDraw({
     loadFeatureForEditing,
     removeFeatureFromDraw,
     trashLastVertex,
+    reenterDrawMode,
+    suppressNextCreateRef,
   };
 }
