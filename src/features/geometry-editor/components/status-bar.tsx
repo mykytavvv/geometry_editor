@@ -16,6 +16,7 @@ const TOOL_LABELS: Record<ToolMode, string> = {
   measure_area: "面積測定",
   coordinate_input: "座標入力",
   draw_clip_polygon: "クリップ領域描画",
+  merge_parts: "パート結合",
 };
 
 interface StatusBarProps {
@@ -27,6 +28,8 @@ interface StatusBarProps {
   selectedCount: number;
   multiDrawPartCount?: number;
   multiDrawType?: "line" | "polygon" | null;
+  selectedPartCount?: number;
+  totalPartCount?: number;
 }
 
 export function StatusBar({
@@ -38,6 +41,8 @@ export function StatusBar({
   selectedCount,
   multiDrawPartCount = 0,
   multiDrawType = null,
+  selectedPartCount = 0,
+  totalPartCount = 0,
 }: StatusBarProps) {
   return (
     <div className="absolute bottom-16 left-1/2 z-10 -translate-x-1/2">
@@ -77,6 +82,11 @@ export function StatusBar({
               クリックで頂点を追加 / Enterで確定 / Escでキャンセル / Backspaceで戻す
             </span>
           )}
+          {activeTool === "merge_parts" && (
+            <span className="ml-1 text-park">
+              パートをクリックして選択 / Enterで結合 / Escでキャンセル
+            </span>
+          )}
         </span>
 
         {/* Live measurement */}
@@ -96,6 +106,11 @@ export function StatusBar({
           {featureCount} 件
           {selectedCount > 0 && (
             <span className="ml-1 text-park">({selectedCount} 選択)</span>
+          )}
+          {activeTool === "merge_parts" && selectedPartCount > 0 && (
+            <span className="ml-1 text-park">
+              ({selectedPartCount}/{totalPartCount} パート選択)
+            </span>
           )}
         </span>
       </div>

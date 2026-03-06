@@ -6,7 +6,7 @@ A Japanese-language park management geometry editor built with Next.js 16 (App R
 
 The UI is entirely in Japanese. The app title is "公園管理 - ジオメトリエディター".
 
-**Current stage**: Functional MVP with mock data. No backend/API — features are persisted to `localStorage`. Some features are scaffolded (see "Incomplete Features" below). Multi-geometry support (MultiLineString, MultiPolygon) has been implemented with unified drawing UX and vertex editing. Vertex editing supports all editable geometry types: Polygon, MultiPolygon, LineString, and MultiLineString. Continue drawing from a selected vertex is supported (Figma-style: select vertex in vertex edit, press G/L to extend). Polygon clipping (boolean subtraction) has been implemented. Point tool is persistent (continuous placement). Multi-select supports shift+click in both select and draw_point modes. Bulk property editing is supported for multi-selected features.
+**Current stage**: Functional MVP with mock data. No backend/API — features are persisted to `localStorage`. Some features are scaffolded (see "Incomplete Features" below). Multi-geometry support (MultiLineString, MultiPolygon) has been implemented with unified drawing UX and vertex editing. Vertex editing supports all editable geometry types: Polygon, MultiPolygon, LineString, and MultiLineString. Continue drawing from a selected vertex is supported (Figma-style: select vertex in vertex edit, press G/L to extend). Polygon clipping (boolean subtraction) has been implemented. Point tool is persistent (continuous placement). Multi-select supports shift+click in both select and draw_point modes. Bulk property editing is supported for multi-selected features. Park mode has specialized behaviors: drawn polygons are auto-appended to the existing MultiPolygon (no Enter confirmation), and an interactive merge-parts tool allows merging individual parts of a MultiPolygon. Facility mode displays a non-editable park boundary polygon as background context so the user can see the park while placing facility points inside it.
 
 ---
 
@@ -39,7 +39,7 @@ src/
 │   ├── layout.tsx                           # Root layout: Noto Sans JP font, TooltipProvider, Toaster
 │   ├── page.tsx                             # Redirects to /geometry-editor
 │   └── geometry-editor/
-│       └── page.tsx                         # Main editor page (orchestrator): multi-draw auto-finalize, canMerge for Multi*, floating 完了/キャンセル element, fly-to handler
+│       └── page.tsx                         # Main editor page (orchestrator): multi-draw auto-finalize, canMerge for Multi*, floating 完了/キャンセル element, fly-to handler, merge_parts floating action bar, isParkMode detection, passes backgroundParkBoundary to MapEditor in facility mode
 ├── components/
 │   ├── layout/
 │   │   ├── header.tsx                       # Top bar: breadcrumbs, save/cancel, user display
@@ -64,28 +64,29 @@ src/
 │       └── tooltip.tsx
 ├── features/
 │   └── geometry-editor/
-│       ├── constants.ts                     # Map config, layer colors, tool groups, snap thresholds, multi-draw layer IDs, continue-draw layer IDs
-│       ├── mock-data.ts                     # 10 sample features around Chikusa Park (facilities linked to parks via parkId)
-│       ├── types.ts                         # All type definitions (ToolMode incl. draw_clip_polygon + continue_drawing, ParkFeature w/ Multi* geometry, EditorState incl. ContinueDrawingState, EditorAction incl. BULK_UPDATE_PROPERTIES + continue drawing actions, DrawingPartsType)
+│       ├── constants.ts                     # Map config, layer colors, tool groups, snap thresholds, multi-draw layer IDs, continue-draw layer IDs, selected-parts layer IDs, park-background layer IDs
+│       ├── editor-mode-config.ts             # Editor mode configurations (park mode: allowedTools incl. merge_parts, tool restrictions per mode)
+│       ├── mock-data.ts                     # 10 sample features around Chikusa Park (facilities linked to parks via parkId), park background boundary for facility mode
+│       ├── types.ts                         # All type definitions (ToolMode incl. draw_clip_polygon + continue_drawing + merge_parts, ParkFeature w/ Multi* geometry, EditorState incl. ContinueDrawingState + selectedPartIndices, EditorAction incl. BULK_UPDATE_PROPERTIES + continue drawing + APPEND_POLYGON_TO_FEATURE + SELECT_PARTS + MERGE_PARTS, DrawingPartsType)
 │       ├── components/
 │       │   ├── attribute-editor.tsx          # Key-value attribute editor for linkedAttributes
 │       │   ├── coordinate-input-dialog.tsx   # Dialog for WGS84 coordinate entry (point only)
-│       │   ├── floating-toolbar.tsx          # Bottom-center toolbar: tools, edit ops, measure, history, precision
+│       │   ├── floating-toolbar.tsx          # Bottom-center toolbar: tools, edit ops, measure, history, precision. Merge button is tool toggle in park mode.
 │       │   ├── layer-panel.tsx               # Left overlay: park-based hierarchy (each park is a collapsible group with nested facilities), per-park visibility toggles, per-group & per-feature fly-to buttons (LocateFixed icon), draft as top-level group. Multi* type icons.
-│       │   ├── map-editor.tsx               # Core map component: MapLibre init, layers, events, keyboard shortcuts, drag-to-move, vertex edit integration, continue drawing integration, multi-part drawing lifecycle, clip polygon interception
+│       │   ├── map-editor.tsx               # Core map component: MapLibre init, layers, events, keyboard shortcuts, drag-to-move, vertex edit integration, continue drawing integration, multi-part drawing lifecycle, clip polygon interception, park mode auto-append, merge_parts click handler, selected-parts layers, park background layers (facility mode)
 │       │   ├── properties-panel.tsx          # Right overlay: 2-tab panel (properties, geometry), layer dropdown + parkId selector with auto-assign, pill toggle on left edge. Multi* type icons/labels and coordinate display. Bulk editing UI for multi-select (layer, parkId, icon, size).
-│       │   ├── status-bar.tsx               # Bottom status: cursor coords, active tool (incl. クリップ領域描画), live measurement, feature count, multi-part drawing state
+│       │   ├── status-bar.tsx               # Bottom status: cursor coords, active tool (incl. クリップ領域描画, パート結合), live measurement, feature count, multi-part drawing state, merge_parts hint text + part count
 │       │   └── text-input-dialog.tsx         # Dialog for text label placement
 │       ├── hooks/
 │       │   ├── use-continue-drawing.ts       # Continue drawing from vertex: custom MapLibre overlay (rubber-band, snap indicator, snap-to-finish on same-feature vertices)
-│       │   ├── use-editor-state.ts           # Central state management (useReducer, 36 actions, undo/redo, multi-draw parts, continue drawing, bulk property updates)
+│       │   ├── use-editor-state.ts           # Central state management (useReducer, 39 actions, undo/redo, multi-draw parts, continue drawing, bulk property updates, park mode actions)
 │       │   ├── use-map-draw.ts              # MapboxDraw integration and lifecycle
 │       │   ├── use-measurement.ts            # Measurement workflow (start, add point, finish, save as geometry)
 │       │   ├── use-snapping.ts              # Vertex snapping wrapper
 │       │   └── use-vertex-edit.ts           # Vertex editing for Polygon/MultiPolygon/LineString/MultiLineString (drag, add, delete vertices via custom MapLibre layers, part-aware). Exports getSelectedVertex(), isLineGeometry(), isPolygonGeometry(), getEditableCoords().
 │       └── lib/
 │           ├── camera.ts                    # Map camera utilities: flyToLayer() — fly/zoom to fit a set of features (turf.bbox + MapLibre flyTo/fitBounds)
-│           ├── geometry-ops.ts              # Duplicate, merge, clip (boolean subtraction), create features, normalizeDrawingParts, normalizeToPolygonGeometry (Turf.js). Multi* geometry support.
+│           ├── geometry-ops.ts              # Duplicate, merge, clip (boolean subtraction), create features, normalizeDrawingParts, normalizeToPolygonGeometry, mergeMultiPolygonParts (Turf.js). Multi* geometry support.
 │           ├── measurement.ts               # Distance/area/perimeter calculation + formatting (Turf.js). Multi* geometry metrics.
 │           ├── snapping.ts                  # Vertex snapping logic (edge snapping stubbed)
 │           ├── spatial-utils.ts             # Spatial utilities: findContainingPark() for auto-assigning facilities to parks (Turf.js). Handles all 5 geometry types.
@@ -115,7 +116,7 @@ No external state library (no Redux, Zustand, or Context). All state lives in a 
 {
   features: ParkFeatureCollection;           // All features
   selectedFeatureIds: string[];              // Currently selected
-  activeTool: ToolMode;                      // Active tool (13 modes)
+  activeTool: ToolMode;                      // Active tool (14 modes)
   cursorPosition: [number, number] | null;   // Mouse [lng, lat]
   liveMeasurement: string | null;            // Measurement display string
   undoStack: ParkFeatureCollection[];        // Max 50 snapshots
@@ -133,6 +134,7 @@ No external state library (no Redux, Zustand, or Context). All state lives in a 
   drawingParts: Position[][] | Position[][][] | null;  // Accumulated parts during multi-part drawing
   drawingPartsType: "line" | "polygon" | null;          // Type of parts being drawn
   continueDrawingState: ContinueDrawingState | null;    // Active continue-drawing session
+  selectedPartIndices: number[];              // Selected part indices for merge_parts mode
 }
 ```
 
@@ -149,13 +151,13 @@ No external state library (no Redux, Zustand, or Context). All state lives in a 
 }
 ```
 
-**Reducer actions** (36 types): `SET_TOOL`, `ADD_FEATURE`, `UPDATE_FEATURE`, `BULK_UPDATE_PROPERTIES`, `DELETE_FEATURES`, `SELECT_FEATURES`, `SET_CURSOR`, `SET_LIVE_MEASUREMENT`, `SET_FEATURES`, `UNDO`, `REDO`, `SAVE`, `CANCEL`, `TOGGLE_LEFT_PANEL`, `TOGGLE_RIGHT_PANEL`, `SET_RIGHT_PANEL`, `SET_DRAWING`, `TOGGLE_SNAPPING`, `TOGGLE_LAYER_VISIBILITY`, `TOGGLE_PARK_VISIBILITY`, `SET_MEASUREMENT_STATE`, `DUPLICATE_FEATURES`, `MERGE_FEATURES`, `REPLACE_FEATURES`, `REASSIGN_FEATURE`, `LOAD_SAVED`, `ENTER_VERTEX_EDIT`, `EXIT_VERTEX_EDIT`, `APPEND_DRAWING_PART`, `FINISH_MULTI_DRAWING`, `CLEAR_DRAWING_PARTS`, `START_CONTINUE_DRAWING`, `ADD_CONTINUE_VERTEX`, `UNDO_CONTINUE_VERTEX`, `FINISH_CONTINUE_DRAWING`, `CANCEL_CONTINUE_DRAWING`.
+**Reducer actions** (39 types): `SET_TOOL`, `ADD_FEATURE`, `UPDATE_FEATURE`, `BULK_UPDATE_PROPERTIES`, `DELETE_FEATURES`, `SELECT_FEATURES`, `SET_CURSOR`, `SET_LIVE_MEASUREMENT`, `SET_FEATURES`, `UNDO`, `REDO`, `SAVE`, `CANCEL`, `TOGGLE_LEFT_PANEL`, `TOGGLE_RIGHT_PANEL`, `SET_RIGHT_PANEL`, `SET_DRAWING`, `TOGGLE_SNAPPING`, `TOGGLE_LAYER_VISIBILITY`, `TOGGLE_PARK_VISIBILITY`, `SET_MEASUREMENT_STATE`, `DUPLICATE_FEATURES`, `MERGE_FEATURES`, `REPLACE_FEATURES`, `REASSIGN_FEATURE`, `LOAD_SAVED`, `ENTER_VERTEX_EDIT`, `EXIT_VERTEX_EDIT`, `APPEND_DRAWING_PART`, `FINISH_MULTI_DRAWING`, `CLEAR_DRAWING_PARTS`, `START_CONTINUE_DRAWING`, `ADD_CONTINUE_VERTEX`, `UNDO_CONTINUE_VERTEX`, `FINISH_CONTINUE_DRAWING`, `CANCEL_CONTINUE_DRAWING`, `APPEND_POLYGON_TO_FEATURE`, `SELECT_PARTS`, `MERGE_PARTS`.
 
 **Undo/redo**: Before any feature mutation, the entire features collection is deep-cloned (`JSON.parse(JSON.stringify(...))`) and pushed to the undo stack. Redo stack is cleared on new actions.
 
 **Derived state** (via `useMemo`): `selectedFeatures`, `visibleFeatures` (filtered by both layer visibility and per-park visibility), `canUndo`, `canRedo`, `isDirty`.
 
-The `useEditorState` hook returns `state`, `dispatch`, 36 memoized action callbacks (including `enterVertexEdit(featureId, partIndex?)`, `exitVertexEdit()`, `appendDrawingPart()`, `finishMultiDrawing()`, `clearDrawingParts()`, `bulkUpdateProperties(ids, properties)`, `startContinueDrawing()`, `addContinueVertex()`, `undoContinueVertex()`, `finishContinueDrawing()`, `cancelContinueDrawing()`), and derived state. The return type is exported as `EditorActions`.
+The `useEditorState` hook returns `state`, `dispatch`, 39 memoized action callbacks (including `enterVertexEdit(featureId, partIndex?)`, `exitVertexEdit()`, `appendDrawingPart()`, `finishMultiDrawing()`, `clearDrawingParts()`, `bulkUpdateProperties(ids, properties)`, `startContinueDrawing()`, `addContinueVertex()`, `undoContinueVertex()`, `finishContinueDrawing()`, `cancelContinueDrawing()`, `appendPolygonToFeature(featureId, polygonCoords)`, `selectParts(partIndices)`, `mergeParts(featureId)`), and derived state. The return type is exported as `EditorActions`.
 
 ### Component Hierarchy
 
@@ -178,6 +180,7 @@ GeometryEditorPage (orchestrator)
 ├── FloatingToolbar (bottom-center tool palette)
 ├── Floating 完了/キャンセル element (bottom-20, above toolbar, visible during multi-draw)
 ├── Floating 描画延長中 element (bottom-20, amber-themed, visible during continue drawing — shows vertex count, 確定/キャンセル buttons)
+├── Floating merge_parts action bar (bottom-20, visible in merge_parts mode — shows part count, キャンセル/完了 buttons)
 ├── TextInputDialog (modal for text placement)
 └── CoordinateInputDialog (modal for coordinate entry)
 ```
@@ -247,7 +250,7 @@ Each group header has a fly-to button (LocateFixed icon) that moves the map came
 - When a feature's layer is changed to `"facilities"` in the properties panel, the system auto-assigns `parkId` by checking which park polygon contains the feature (using Turf.js `booleanPointInPolygon`).
 - Users can manually override `parkId` via a dropdown in the properties panel listing all park features.
 
-### Tool Modes (13)
+### Tool Modes (14)
 | Mode | Label | Shortcut | Status |
 |---|---|---|---|
 | `select` | 選択 | V | Implemented |
@@ -263,6 +266,7 @@ Each group header has a fly-to button (LocateFixed icon) that moves the map came
 | `measure_area` | 面積測定 | A | Implemented |
 | `coordinate_input` | 座標入力 | — | Implemented (point only) |
 | `draw_clip_polygon` | クリップ領域描画 | — | Implemented (scissors button, draws polygon cutter for boolean subtraction) |
+| `merge_parts` | パート結合 | — | Implemented (park mode only — toggle via merge toolbar button, click parts to select, Enter to merge) |
 
 ---
 
@@ -275,9 +279,15 @@ Each group header has a fly-to button (LocateFixed icon) that moves the map came
 - **Controls**: NavigationControl (top-right, no compass), ScaleControl (bottom-left)
 
 ### GeoJSON Sources and Layers
-Four GeoJSON sources (three permanent, one dynamic) with 13+ layers.
+Multiple GeoJSON sources (three permanent, several dynamic) with 15+ layers.
 
 **Note on Multi* geometry and layer filters**: MapLibre layer filters like `["==", ["geometry-type"], "Polygon"]` automatically match both `Polygon` and `MultiPolygon`. Same for `LineString`/`MultiLineString`. No layer filter changes were needed for Multi* support.
+
+**Source `park-background`** (non-editable park boundary, facility mode only):
+- `park-background-fill` — subtle green fill (`#4a7c59`, opacity 0.12), rendered below all editable layers
+- `park-background-outline` — green dashed outline (width 2, dash pattern [4, 3])
+- Completely inert — no click/select/edit handlers interact with this source. Purely visual context so the user can see the park while placing facility points.
+- Data is set via the `backgroundParkBoundary` prop on `MapEditor`, which is only passed in facility mode. When not in facility mode, the source contains an empty FeatureCollection.
 
 **Source `park-features`** (main data):
 - `park-polygons-fill` — per-layer colored fill, opacity 0.25
@@ -308,6 +318,11 @@ Four GeoJSON sources (three permanent, one dynamic) with 13+ layers.
 - `continue-draw-rubberband-line` — green dashed line from last placed vertex to cursor
 - `continue-draw-snap-indicator` — green circle that appears when cursor hovers over an existing vertex of the same feature (snap-to-finish target)
 
+**Source `selected-parts`** (dynamic, populated during `merge_parts` mode):
+- `selected-parts-fill` — amber fill (`#f59e0b`, opacity 0.3) for selected MultiPolygon parts
+- `selected-parts-outline` — amber solid outline (width 2) for selected parts
+- When parts are selected, the default feature-level selection highlight (green) is suppressed to avoid visual overlap.
+
 **Source `vertex-edit-features`** (dynamic, created/destroyed on vertex edit enter/exit):
 - `vertex-edit-outline` — amber solid outline of the feature part being edited (renders as Polygon for polygon types, LineString for line types)
 - `vertex-edit-vertices` — white vertex handles at each vertex (stroke: amber)
@@ -320,7 +335,7 @@ Four GeoJSON sources (three permanent, one dynamic) with 13+ layers.
 - Default UI controls hidden; modes switched programmatically.
 - `draw.create` converts MapboxDraw features to `ParkFeature` with new UUID, then removes from draw. For points, re-enters `draw_point` mode after 50ms so the user can keep placing points continuously. A `suppressNextCreateRef` allows the map click handler to suppress unwanted point creation (e.g. when shift+clicking for multi-select).
 - `draw.update` maps back to existing features via `_parkId` property.
-- Mode mapping: `draw_point`→`draw_point`, `draw_line`→`draw_line_string`, `draw_polygon`/`draw_clip_polygon`→`draw_polygon`, `draw_text`→`draw_point`, all others→`simple_select`.
+- Mode mapping: `draw_point`→`draw_point`, `draw_line`→`draw_line_string`, `draw_polygon`/`draw_clip_polygon`→`draw_polygon`, `draw_text`→`draw_point`, all others (including `merge_parts`)→`simple_select`.
 - **Post-creation selection guard** (`justCreatedAtRef`): When a feature is created, MapboxDraw fires spurious `draw.selectionchange` events with empty features (from its internal mode switch to `simple_select` and from our `activeTool` sync effect). A timestamp-based ref (`justCreatedAtRef`) suppresses empty selection-change events for 300ms after creation, and also skips the redundant `draw.changeMode("simple_select")` call in the tool-sync effect. Without this guard, newly created features would appear unselected.
 
 ### Persistent Point Tool
@@ -436,9 +451,9 @@ When the cursor hovers near an existing vertex of the same feature being edited 
 | Ctrl+Z | Undo (or trash last vertex while drawing) | Always |
 | Ctrl+Shift+Z / Ctrl+Y | Redo | Always |
 | Ctrl+D | Duplicate selected | Always |
-| Enter | Finish multi-part drawing / finish continue drawing | Multi-draw or continue drawing active |
+| Enter | Finish multi-part drawing / finish continue drawing / confirm merge parts | Multi-draw or continue drawing or merge_parts active |
 | Delete | Delete selected feature (or delete selected vertex in vertex edit) | Has selection |
-| Escape | Exit vertex edit / cancel continue drawing / finalize multi-draw / cancel draw / clear measurement / deselect | Always |
+| Escape | Exit vertex edit / cancel continue drawing / finalize multi-draw / cancel draw / clear measurement / cancel merge_parts / deselect | Always |
 | Backspace | Remove last vertex (drawing) / remove last new vertex (continue drawing) / delete selected vertex (vertex edit) | While drawing / continue drawing / vertex edit |
 | Double-click | Enter vertex edit mode on Polygon/MultiPolygon/LineString/MultiLineString | Select mode, polygon or line hit |
 
@@ -465,6 +480,7 @@ When the cursor hovers near an existing vertex of the same feature being edited 
 | `createDefaultFeature()` | Complete | Factory with defaults, assigns to draft layer. Supports all 5 geometry types. |
 | `normalizeDrawingParts()` | Complete | Converts accumulated drawing parts to the correct geometry: 1 part → simple (LineString/Polygon), 2+ parts → Multi* (MultiLineString/MultiPolygon) |
 | `offsetGeometry()` | Complete | Handles all 5 geometry types for duplicate offset |
+| `mergeMultiPolygonParts()` | Complete | Merges selected parts of a MultiPolygon via `turf.union`. Extracts selected parts, unions them, preserves unselected parts, normalizes to Polygon if only 1 part remains after merge. |
 
 ### Snapping (`lib/snapping.ts` + `hooks/use-snapping.ts`)
 - **Vertex snapping**: Extracts all vertices from all features (Point, LineString, MultiLineString, Polygon, MultiPolygon), projects to screen coords via map's `project()`, finds nearest within `SNAP_THRESHOLD_PX` (10px).
@@ -501,6 +517,45 @@ Boolean subtraction: the user draws a polygon to define a region, and that regio
 - Re-clipping a previously clipped MultiPolygon is supported
 
 **Key design principle**: Clipping modifies geometry, never creates new features. ONE FEATURE → ONE GEOMETRY.
+
+### Park Mode (`map-editor.tsx` + `page.tsx` + `floating-toolbar.tsx` + `editor-mode-config.ts`)
+Park mode is a specialized editor mode for editing park boundary polygons (MultiPolygon features). It activates when the editor is configured for park editing (detected via `isParkMode` prop passed to `MapEditor`). Park mode modifies several default behaviors:
+
+**Auto-append polygons** (`APPEND_POLYGON_TO_FEATURE`):
+- In park mode, when the user draws a polygon via the polygon tool, the new polygon is **automatically appended** to the first existing Polygon/MultiPolygon feature instead of creating a separate feature.
+- `handleFeatureCreated` in `map-editor.tsx` intercepts the creation: finds the first polygon/multipolygon feature, calls `editor.appendPolygonToFeature(featureId, coords)`.
+- The reducer handles Polygon→MultiPolygon conversion (if the target was a simple Polygon) or coordinate append (if already MultiPolygon).
+- No Enter/confirmation step needed — the polygon is committed immediately.
+- The tool stays in `draw_polygon` mode so the user can keep drawing more parts.
+- Pushes to undo stack so each append is independently undoable.
+
+**Merge-parts tool mode** (`merge_parts`):
+- `merge_parts` is added to the `allowedTools` list in park mode's `editorModeConfig`.
+- The merge button in the floating toolbar becomes a **tool toggle** in park mode (instead of a one-shot merge action). Clicking it enters/exits `merge_parts` mode. The button shows an active highlight when in `merge_parts` mode.
+- **Click handler**: In `merge_parts` mode, clicking a polygon part on the map toggles that part's index in `selectedPartIndices`. Part detection uses `turf.booleanPointInPolygon` against each part of the MultiPolygon — same logic as double-click vertex edit.
+- **Selected parts highlighting**: Selected parts are rendered with amber fill/outline via the `selected-parts` GeoJSON source. When parts are selected, the default green feature-level selection highlight is suppressed (no dual highlighting).
+- **Floating action bar** (`page.tsx`): Shows `{N} パート | キャンセル | 完了 [Enter]`. The 完了 button is disabled until 2+ parts are selected. Positioned at `bottom-20` above the main toolbar.
+- **Keyboard**: Enter confirms merge (if 2+ parts selected), Escape cancels and returns to select mode.
+- **On merge confirm**: `MERGE_PARTS` action calls `mergeMultiPolygonParts()` which extracts selected parts, unions them via `turf.union`, preserves unselected parts, and normalizes the result (Polygon if 1 part remains, MultiPolygon otherwise). Feature is updated in-place with undo support.
+- **Status bar**: Shows "パートをクリックして選択 / Enterで結合 / Escでキャンセル" hint text and part count.
+- **Cursor**: Set to `pointer` in `merge_parts` mode.
+
+**State cleanup for `selectedPartIndices`**: Cleared on `SELECT_FEATURES`, `UNDO`, `REDO`, `CANCEL`, `LOAD_SAVED`, and any `SET_TOOL` away from `merge_parts`.
+
+**Single click vs double-click in park mode**:
+- Single click on a park polygon = select entire feature (all parts, green highlight, normal select behavior).
+- Double-click on a specific part = enter vertex edit for that part only.
+- Part-level selection only happens inside `merge_parts` tool mode.
+
+### Facility Mode Park Background (`map-editor.tsx` + `page.tsx` + `mock-data.ts`)
+Facility mode displays a non-editable park boundary polygon as visual background context. This lets the user see the park while placing facility points inside it — reflecting the real-world workflow where facilities are always placed within a park.
+
+**Implementation**: Uses a completely separate MapLibre GeoJSON source (`park-background`) with its own fill and outline layers, rendered below all editable feature layers. The source and layers are always created (as empty), but only populated with data when in facility mode.
+
+- **Data**: `FACILITY_PARK_BOUNDARY` in `mock-data.ts` — a `ParkFeatureCollection` containing the Chikusa Park polygon (same shape as `PARK_MOCK_FEATURES`).
+- **Prop**: `MapEditor` accepts an optional `backgroundParkBoundary?: ParkFeatureCollection` prop. `page.tsx` passes `FACILITY_PARK_BOUNDARY` only when `editorMode === "facility"`, otherwise `undefined`.
+- **Rendering**: Subtle green fill (opacity 0.12) with dashed green outline. Clearly distinguishable as non-editable background.
+- **Isolation**: The park background is completely inert — no click handlers, no selection, no snapping, no editing, no inclusion in feature counts or `maxFeatureCount` checks. The `findContainingPark()` function searches only the editable feature collection, not the background source.
 
 ### Bulk Property Editing (`properties-panel.tsx` + `use-editor-state.ts`)
 When multiple features are selected, the properties panel shows a bulk editing UI instead of the single-feature editor:

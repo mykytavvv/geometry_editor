@@ -2,59 +2,46 @@
 
 import React from "react";
 import { ChevronDown, User } from "lucide-react";
-import { Button } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
+import type { EditorMode } from "@/features/geometry-editor/types";
+import { EDITOR_MODES } from "@/features/geometry-editor/editor-mode-config";
 
 interface HeaderProps {
-  breadcrumbs?: string[];
-  onSave: () => void;
-  onCancel: () => void;
+  editorMode: EditorMode;
+  onModeChange: (mode: EditorMode) => void;
 }
 
-export function Header({ breadcrumbs = ["公園", "名城公園", "ジオメトリエディター"], onSave, onCancel }: HeaderProps) {
+export function Header({ editorMode, onModeChange }: HeaderProps) {
   return (
     <header className="flex h-14 min-h-14 items-center justify-between border-b border-border bg-background px-4">
-      {/* Breadcrumb */}
-      <nav className="flex items-center text-sm text-muted-foreground">
-        {breadcrumbs.map((crumb, i) => (
-          <React.Fragment key={i}>
-            {i > 0 && <span className="mx-1.5">/</span>}
-            <span
-              className={
-                i === breadcrumbs.length - 1
-                  ? "font-medium text-foreground"
-                  : "hover:text-foreground cursor-pointer"
-              }
-            >
-              {crumb}
-            </span>
-          </React.Fragment>
+      {/* Mode Switcher */}
+      <div className="flex items-center rounded-lg border border-border/60 bg-muted/50 p-0.5">
+        {EDITOR_MODES.map(({ mode, label }) => (
+          <button
+            key={mode}
+            onClick={() => onModeChange(mode)}
+            className={cn(
+              "rounded-md px-3 py-1.5 text-xs font-medium transition-all",
+              editorMode === mode
+                ? "bg-park text-park-foreground shadow-sm"
+                : "text-muted-foreground hover:text-foreground hover:bg-background/80"
+            )}
+          >
+            {label}
+          </button>
         ))}
-      </nav>
+      </div>
 
-      {/* Actions */}
-      <div className="flex items-center gap-3">
-        <Button variant="outline" size="sm" onClick={onCancel}>
-          キャンセル
-        </Button>
-        <Button
-          size="sm"
-          onClick={onSave}
-          className="bg-park text-park-foreground hover:bg-park/90"
-        >
-          保存
-        </Button>
-
-        {/* User */}
-        <div className="ml-2 flex items-center gap-2 border-l border-border pl-4">
-          <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
-            <User className="h-4 w-4 text-muted-foreground" />
-          </div>
-          <div className="hidden text-right sm:block">
-            <p className="text-xs font-medium leading-tight">山田 太郎</p>
-            <p className="text-[10px] text-muted-foreground">公園管理者</p>
-          </div>
-          <ChevronDown className="h-3 w-3 text-muted-foreground" />
+      {/* User */}
+      <div className="flex items-center gap-2">
+        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-muted">
+          <User className="h-4 w-4 text-muted-foreground" />
         </div>
+        <div className="hidden text-right sm:block">
+          <p className="text-xs font-medium leading-tight">山田 太郎</p>
+          <p className="text-[10px] text-muted-foreground">公園管理者</p>
+        </div>
+        <ChevronDown className="h-3 w-3 text-muted-foreground" />
       </div>
     </header>
   );

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
 import { toast } from "sonner";
 import type { Map as MaplibreMap } from "maplibre-gl";
@@ -13,16 +13,37 @@ import { LayerPanel } from "@/features/geometry-editor/components/layer-panel";
 import { PropertiesPanel } from "@/features/geometry-editor/components/properties-panel";
 import { StatusBar } from "@/features/geometry-editor/components/status-bar";
 import { CoordinateInputDialog } from "@/features/geometry-editor/components/coordinate-input-dialog";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipTrigger,
+  TooltipContent,
+} from "@/components/ui/tooltip";
 
 import { useEditorState } from "@/features/geometry-editor/hooks/use-editor-state";
 import { useMeasurement } from "@/features/geometry-editor/hooks/use-measurement";
-import { MOCK_FEATURES } from "@/features/geometry-editor/mock-data";
+import { MOCK_FEATURES, PARK_MOCK_FEATURES, FACILITY_MOCK_FEATURES, FACILITY_PARK_BOUNDARY } from "@/features/geometry-editor/mock-data";
 import { loadFeatures, saveFeatures } from "@/features/geometry-editor/lib/storage";
 import { flyToLayer } from "@/features/geometry-editor/lib/camera";
-import type { ParkFeature } from "@/features/geometry-editor/types";
-import { isLineGeometry, isPolygonGeometry, getEditableCoords } from "@/features/geometry-editor/hooks/use-vertex-edit";
+import type { EditorMode, ParkFeature, ParkFeatureCollection } from "@/features/geometry-editor/types";
+import { getEditorModeConfig } from "@/features/geometry-editor/editor-mode-config";
+
+// ─── Mock data lookup per mode ───────────────────────────────
+function getMockDataForMode(mode: EditorMode): ParkFeatureCollection {
+  switch (mode) {
+    case "full":
+      return MOCK_FEATURES;
+    case "park":
+      return PARK_MOCK_FEATURES;
+    case "facility":
+      return FACILITY_MOCK_FEATURES;
+  }
+}
 
 export default function GeometryEditorPage() {
+  const [editorMode, setEditorMode] = useState<EditorMode>("full");
+  const modeConfig = useMemo(() => getEditorModeConfig(editorMode), [editorMode]);
+
   const editor = useEditorState(MOCK_FEATURES);
   const { state } = editor;
 
@@ -33,6 +54,12 @@ export default function GeometryEditorPage() {
 
   // Ref to access the selected vertex from vertex edit mode (populated by MapEditor)
   const getSelectedVertexRef = useRef<(() => { ringIndex: number; vertexIndex: number } | null) | null>(null);
+
+  // ─── Breadcrumbs (mode-specific suffix) ────────────────────
+  const breadcrumbs = useMemo(
+    () => ["公園", "名城公園", modeConfig.breadcrumbSuffix],
+    [modeConfig.breadcrumbSuffix]
+  );
 
   // ─── Load saved features from localStorage after hydration ──
   useEffect(() => {
@@ -67,9 +94,48 @@ export default function GeometryEditorPage() {
     addFeature: editor.addFeature,
   });
 
+  // ─── Mode switching ────────────────────────────────────────
+  const handleModeChange = useCallback(
+    (mode: EditorMode) => {
+      if (mode === editorMode) return;
+
+      if (editor.isDirty) {
+        const confirmed = window.confirm(
+          "変更が保存されていません。モードを切り替えますか？"
+        );
+        if (!confirmed) return;
+      }
+
+      setEditorMode(mode);
+      const mockData = getMockDataForMode(mode);
+      editor.loadSaved(mockData);
+
+      // Reset any active tool / drawing state
+      editor.setTool("select");
+      setSplitTargetId(null);
+      setCoordDialogOpen(false);
+    },
+    [editorMode, editor]
+  );
+
   // ─── Handle tool changes (start measurement modes) ─────────
   const handleSetTool = useCallback(
     (tool: typeof state.activeTool) => {
+      // Guard: only allow tools that are in the current mode's allowed tools
+      if (!modeConfig.allowedTools.includes(tool)) {
+        return;
+      }
+
+      // Facility mode: block draw_point if feature limit reached
+      if (
+        modeConfig.mode === "facility" &&
+        tool === "draw_point" &&
+        modeConfig.maxFeatureCount !== undefined &&
+        state.features.features.length >= modeConfig.maxFeatureCount
+      ) {
+        return;
+      }
+
       // If switching away from a multi-part draw with accumulated parts, finalize them
       if (
         state.drawingParts &&
@@ -107,66 +173,13 @@ export default function GeometryEditorPage() {
         measurement.startMeasurement("area");
       }
 
-      // ── Continue drawing from selected vertex ──
-      // If in vertex edit mode with a selected vertex, and user switches to a
-      // matching draw tool (G for polygon, L for line), start continue drawing
-      // from that vertex instead of entering fresh draw mode.
-      if (
-        (tool === "draw_polygon" || tool === "draw_line") &&
-        state.vertexEditFeatureId
-      ) {
-        const selectedVertex = getSelectedVertexRef.current?.();
-        if (selectedVertex) {
-          const feat = state.features.features.find((f) => f.id === state.vertexEditFeatureId);
-          if (feat) {
-            const isLine = isLineGeometry(feat);
-            const isPoly = isPolygonGeometry(feat);
-            const matchesGeometry =
-              (tool === "draw_polygon" && isPoly) ||
-              (tool === "draw_line" && isLine);
-
-            if (matchesGeometry) {
-              // For lines: only endpoints are valid for continuing
-              if (isLine) {
-                const editCoords = getEditableCoords(feat, state.vertexEditPartIndex);
-                if (editCoords) {
-                  const ring = editCoords[selectedVertex.ringIndex];
-                  if (ring) {
-                    const lastIdx = ring.length - 1;
-                    if (selectedVertex.vertexIndex === 0 || selectedVertex.vertexIndex === lastIdx) {
-                      const insertDirection = selectedVertex.vertexIndex === lastIdx ? "append" as const : "prepend" as const;
-                      editor.startContinueDrawing(
-                        feat.id,
-                        state.vertexEditPartIndex,
-                        selectedVertex.ringIndex,
-                        selectedVertex.vertexIndex,
-                        "line",
-                        insertDirection,
-                      );
-                      return; // Don't fall through to setTool
-                    }
-                  }
-                }
-              } else {
-                // Polygon: any vertex is valid
-                editor.startContinueDrawing(
-                  feat.id,
-                  state.vertexEditPartIndex,
-                  selectedVertex.ringIndex,
-                  selectedVertex.vertexIndex,
-                  "polygon",
-                  "append",
-                );
-                return; // Don't fall through to setTool
-              }
-            }
-          }
-        }
-      }
+      // For draw_polygon: the first click in map-editor.tsx will detect
+      // vertex/edge/free-space and start continue_drawing automatically.
+      // No special handling needed here.
 
       editor.setTool(tool);
     },
-    [editor, measurement, state.measurementState, state.drawingParts, state.drawingPartsType, state.activeTool, state.vertexEditFeatureId, state.vertexEditPartIndex, state.features.features]
+    [editor, measurement, modeConfig, state.measurementState, state.drawingParts, state.drawingPartsType, state.activeTool, state.features.features]
   );
 
   // ─── Measurement click listener ────────────────────────────
@@ -224,13 +237,28 @@ export default function GeometryEditorPage() {
   );
 
   // ─── Save / Cancel ─────────────────────────────────────────
+  const saveValidation = useMemo(
+    () => modeConfig.validateOnSave(state.features.features),
+    [modeConfig, state.features.features]
+  );
+  const isSaveDisabled = !saveValidation.valid;
+
   const handleSave = useCallback(() => {
+    // Mode-specific validation
+    const validation = modeConfig.validateOnSave(state.features.features);
+    if (!validation.valid) {
+      toast.error("保存できません", {
+        description: validation.message,
+      });
+      return;
+    }
+
     editor.save();
     saveFeatures(state.features);
     toast.success("保存しました", {
       description: `${state.features.features.length} 件のフィーチャーを保存しました`,
     });
-  }, [editor, state.features]);
+  }, [editor, state.features, modeConfig]);
 
   const handleCancel = useCallback(() => {
     if (editor.isDirty) {
@@ -253,6 +281,15 @@ export default function GeometryEditorPage() {
     [mapInstance]
   );
 
+  // ─── Fly to all features (toolbar action) ──────────────────
+  const handleFlyToAll = useCallback(() => {
+    if (mapInstance && state.features.features.length > 0) {
+      flyToLayer(mapInstance, state.features.features);
+    }
+  }, [mapInstance, state.features.features]);
+
+  const flyToDisabled = state.features.features.length === 0;
+
   // ─── Split handler ─────────────────────────────────────────
   const handleSplit = useCallback(() => {
     if (state.selectedFeatureIds.length !== 1) return;
@@ -269,7 +306,7 @@ export default function GeometryEditorPage() {
     });
   }, [editor, state.selectedFeatureIds, state.features.features]);
 
-  // ─── Merge check ──────────────────────────────────────────
+  // ─── Merge check (for non-park mode feature-level merge) ────
   const canMerge =
     state.selectedFeatureIds.length >= 2 &&
     (() => {
@@ -283,6 +320,22 @@ export default function GeometryEditorPage() {
       return allPolygons || allLines;
     })();
 
+  const handleMerge = useCallback(() => {
+    editor.mergeSelected();
+  }, [editor]);
+
+  // ─── Merge parts confirm (park mode merge_parts tool) ──────
+  const handleMergePartsConfirm = useCallback(() => {
+    if (state.selectedPartIndices.length >= 2 && state.selectedFeatureIds.length === 1) {
+      editor.mergeParts(state.selectedFeatureIds[0], state.selectedPartIndices);
+    }
+    editor.setTool("select");
+  }, [editor, state.selectedFeatureIds, state.selectedPartIndices]);
+
+  const handleMergePartsCancel = useCallback(() => {
+    editor.setTool("select");
+  }, [editor]);
+
   // ─── Render ────────────────────────────────────────────────
   return (
     <div className="flex h-screen w-screen overflow-hidden">
@@ -290,14 +343,17 @@ export default function GeometryEditorPage() {
       <SideNav
         collapsed={sidebarCollapsed}
         onToggle={() => setSidebarCollapsed((prev) => !prev)}
-        layerPanelOpen={state.leftPanelOpen}
-        onToggleLayerPanel={editor.toggleLeftPanel}
+        layerPanelOpen={modeConfig.showLayerPanelToggle ? state.leftPanelOpen : false}
+        onToggleLayerPanel={modeConfig.showLayerPanelToggle ? editor.toggleLeftPanel : undefined}
       />
 
       {/* Main Content */}
       <div className="flex flex-1 flex-col overflow-hidden">
         {/* Header */}
-        <Header onSave={handleSave} onCancel={handleCancel} />
+        <Header
+          editorMode={editorMode}
+          onModeChange={handleModeChange}
+        />
 
         {/* Map Area */}
         <div className="relative flex-1 overflow-hidden">
@@ -313,32 +369,99 @@ export default function GeometryEditorPage() {
             onMapReady={setMapInstance}
             splitTargetId={splitTargetId}
             getSelectedVertexRef={getSelectedVertexRef}
+            allowedTools={modeConfig.allowedTools}
+            editorMode={editorMode}
+            onFlyTo={modeConfig.showFlyTo && !flyToDisabled ? handleFlyToAll : undefined}
+            backgroundParkBoundary={editorMode === "facility" ? FACILITY_PARK_BOUNDARY : undefined}
           />
 
-          {/* Layer Panel (left) */}
-          <LayerPanel
-            open={state.leftPanelOpen}
-            onToggle={editor.toggleLeftPanel}
-            features={state.features}
-            selectedFeatureIds={state.selectedFeatureIds}
-            layerVisibility={state.layerVisibility}
-            parkVisibility={state.parkVisibility}
-            onSelectFeature={editor.selectFeatures}
-            onToggleLayerVisibility={editor.toggleLayerVisibility}
-            onToggleParkVisibility={editor.toggleParkVisibility}
-            onReassignFeature={editor.reassignFeature}
-            onFlyToFeatures={handleFlyToFeatures}
-          />
+          {/* Floating Breadcrumbs (top-left) */}
+          <div className="absolute top-3 left-3 z-20">
+            <div className="flex items-center rounded-2xl border border-border/50 bg-background/95 px-3 py-2 shadow-lg backdrop-blur-sm">
+              <nav className="flex items-center text-sm text-muted-foreground">
+                {breadcrumbs.map((crumb, i) => (
+                  <React.Fragment key={i}>
+                    {i > 0 && <span className="mx-1.5">/</span>}
+                    <span
+                      className={
+                        i === breadcrumbs.length - 1
+                          ? "font-medium text-foreground"
+                          : "hover:text-foreground cursor-pointer"
+                      }
+                    >
+                      {crumb}
+                    </span>
+                  </React.Fragment>
+                ))}
+              </nav>
+            </div>
+          </div>
 
-          {/* Properties Panel (right) */}
-          <PropertiesPanel
-            open={state.rightPanelOpen}
-            onToggle={editor.toggleRightPanel}
-            selectedFeatures={editor.selectedFeatures}
-            allFeatures={state.features}
-            onUpdateFeature={editor.updateFeature}
-            onBulkUpdateProperties={editor.bulkUpdateProperties}
-          />
+          {/* Floating Save/Cancel (top-right) */}
+          <div className="absolute top-3 right-3 z-20">
+            <div className="flex items-center gap-2 rounded-2xl border border-border/50 bg-background/95 px-3 py-2 shadow-lg backdrop-blur-sm">
+              <Button variant="outline" size="sm" onClick={handleCancel}>
+                キャンセル
+              </Button>
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  {isSaveDisabled ? (
+                    <span className="inline-flex" tabIndex={0}>
+                      <Button
+                        size="sm"
+                        disabled
+                        className="bg-park text-park-foreground hover:bg-park/90"
+                      >
+                        保存
+                      </Button>
+                    </span>
+                  ) : (
+                    <Button
+                      size="sm"
+                      onClick={handleSave}
+                      className="bg-park text-park-foreground hover:bg-park/90"
+                    >
+                      保存
+                    </Button>
+                  )}
+                </TooltipTrigger>
+                {isSaveDisabled && saveValidation.message && (
+                  <TooltipContent side="bottom" className="text-xs max-w-[220px]">
+                    {saveValidation.message}
+                  </TooltipContent>
+                )}
+              </Tooltip>
+            </div>
+          </div>
+
+          {/* Layer Panel (left) — only in full mode */}
+          {modeConfig.showLayerPanel && (
+            <LayerPanel
+              open={state.leftPanelOpen}
+              onToggle={editor.toggleLeftPanel}
+              features={state.features}
+              selectedFeatureIds={state.selectedFeatureIds}
+              layerVisibility={state.layerVisibility}
+              parkVisibility={state.parkVisibility}
+              onSelectFeature={editor.selectFeatures}
+              onToggleLayerVisibility={editor.toggleLayerVisibility}
+              onToggleParkVisibility={editor.toggleParkVisibility}
+              onReassignFeature={editor.reassignFeature}
+              onFlyToFeatures={handleFlyToFeatures}
+            />
+          )}
+
+          {/* Properties Panel (right) — only in full mode */}
+          {modeConfig.showPropertiesPanel && (
+            <PropertiesPanel
+              open={state.rightPanelOpen}
+              onToggle={editor.toggleRightPanel}
+              selectedFeatures={editor.selectedFeatures}
+              allFeatures={state.features}
+              onUpdateFeature={editor.updateFeature}
+              onBulkUpdateProperties={editor.bulkUpdateProperties}
+            />
+          )}
 
           {/* Status Bar */}
           <StatusBar
@@ -350,6 +473,17 @@ export default function GeometryEditorPage() {
             selectedCount={state.selectedFeatureIds.length}
             multiDrawPartCount={state.drawingParts?.length ?? 0}
             multiDrawType={state.drawingPartsType}
+            selectedPartCount={state.selectedPartIndices.length}
+            totalPartCount={
+              state.selectedFeatureIds.length === 1
+                ? (() => {
+                    const f = state.features.features.find((feat) => feat.id === state.selectedFeatureIds[0]);
+                    return f?.geometry.type === "MultiPolygon"
+                      ? (f.geometry as import("geojson").MultiPolygon).coordinates.length
+                      : 0;
+                  })()
+                : 0
+            }
           />
 
           {/* Floating Toolbar */}
@@ -365,13 +499,17 @@ export default function GeometryEditorPage() {
             canMerge={canMerge}
             onDuplicate={editor.duplicateSelected}
             onDelete={editor.deleteSelected}
-            onMerge={editor.mergeSelected}
+            onMerge={handleMerge}
             onSplit={handleSplit}
             snappingEnabled={state.snappingEnabled}
             onToggleSnapping={editor.toggleSnapping}
             onCoordinateInput={handleCoordinateInput}
             onSaveAsMeasurement={measurement.saveAsGeometry}
             isMeasuring={!!state.measurementState && state.measurementState.points.length >= 2}
+            modeConfig={modeConfig}
+            featureCount={state.features.features.length}
+            onFlyTo={handleFlyToAll}
+            flyToDisabled={flyToDisabled}
           />
 
           {/* Continue drawing actions (floating above toolbar) */}
@@ -394,7 +532,7 @@ export default function GeometryEditorPage() {
                   </kbd>
                 </button>
                 <button
-                  onClick={editor.finishContinueDrawing}
+                  onClick={() => editor.finishContinueDrawing("free", null, null)}
                   disabled={state.continueDrawingState.newVertices.length === 0}
                   className="flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-amber-500/90 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
@@ -436,18 +574,48 @@ export default function GeometryEditorPage() {
               </div>
             </div>
           )}
+
+          {/* Merge parts actions (floating above toolbar) */}
+          {state.activeTool === "merge_parts" && (
+            <div className="absolute bottom-20 left-1/2 z-30 -translate-x-1/2 animate-in fade-in slide-in-from-bottom-2 duration-200">
+              <div className="flex items-center gap-2 rounded-xl border border-park/30 bg-background/95 px-3 py-2 shadow-lg backdrop-blur-sm">
+                <span className="text-xs font-medium text-muted-foreground">
+                  {state.selectedPartIndices.length} パート
+                </span>
+                <div className="h-4 w-px bg-border" />
+                <button
+                  onClick={handleMergePartsCancel}
+                  className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                >
+                  キャンセル
+                </button>
+                <button
+                  onClick={handleMergePartsConfirm}
+                  disabled={state.selectedPartIndices.length < 2}
+                  className="flex items-center gap-1.5 rounded-lg bg-park px-3 py-1.5 text-xs font-medium text-park-foreground transition-colors hover:bg-park/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  完了
+                  <kbd className="ml-1 rounded bg-park-foreground/20 px-1 py-0.5 text-[10px] font-mono">
+                    Enter
+                  </kbd>
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* Dialogs */}
-      <CoordinateInputDialog
-        open={coordDialogOpen}
-        onClose={() => {
-          setCoordDialogOpen(false);
-          editor.setTool("select");
-        }}
-        onConfirm={handleCoordinateConfirm}
-      />
+      {/* Dialogs — Coordinate input only shown if mode supports it */}
+      {modeConfig.showCoordinateInput && (
+        <CoordinateInputDialog
+          open={coordDialogOpen}
+          onClose={() => {
+            setCoordDialogOpen(false);
+            editor.setTool("select");
+          }}
+          onConfirm={handleCoordinateConfirm}
+        />
+      )}
     </div>
   );
 }

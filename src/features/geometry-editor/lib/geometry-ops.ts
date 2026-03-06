@@ -342,6 +342,76 @@ export function createDefaultFeature(
 }
 
 /**
+ * Merge specific parts of a MultiPolygon into one using turf.union.
+ *
+ * Takes a MultiPolygon geometry and an array of part indices to merge.
+ * The selected parts are unioned together, and the result replaces them
+ * in the coordinate array. Unselected parts are preserved.
+ *
+ * Returns updated geometry (MultiPolygon or Polygon if only 1 part remains)
+ * and the new feature type, or null if the merge fails.
+ */
+export function mergeMultiPolygonParts(
+  geometry: MultiPolygon,
+  partIndices: number[]
+): { geometry: Polygon | MultiPolygon; featureType: ParkFeatureType } | null {
+  if (partIndices.length < 2) return null;
+
+  const allParts = geometry.coordinates;
+  const sortedIndices = [...partIndices].sort((a, b) => a - b);
+
+  // Validate indices
+  if (sortedIndices.some((i) => i < 0 || i >= allParts.length)) return null;
+
+  try {
+    // Extract the parts to merge as turf polygon features
+    const partsToMerge = sortedIndices.map((i) => turf.polygon(allParts[i]));
+
+    // Iteratively union the selected parts
+    let merged: Feature<Polygon | MultiPolygon> = partsToMerge[0];
+    for (let i = 1; i < partsToMerge.length; i++) {
+      const result = turf.union(
+        turf.featureCollection([merged, partsToMerge[i]])
+      );
+      if (!result) return null;
+      merged = result as Feature<Polygon | MultiPolygon>;
+    }
+
+    // Collect unselected parts (preserve their order)
+    const indicesSet = new Set(sortedIndices);
+    const keptParts: Position[][][] = [];
+    for (let i = 0; i < allParts.length; i++) {
+      if (!indicesSet.has(i)) {
+        keptParts.push(allParts[i]);
+      }
+    }
+
+    // Add merged result part(s)
+    if (merged.geometry.type === "Polygon") {
+      keptParts.push((merged.geometry as Polygon).coordinates);
+    } else {
+      // Union of disjoint parts may still be MultiPolygon
+      keptParts.push(...(merged.geometry as MultiPolygon).coordinates);
+    }
+
+    // Determine final geometry
+    if (keptParts.length === 1) {
+      return {
+        geometry: { type: "Polygon", coordinates: keptParts[0] },
+        featureType: "polygon",
+      };
+    }
+    return {
+      geometry: { type: "MultiPolygon", coordinates: keptParts },
+      featureType: "multipolygon",
+    };
+  } catch (e) {
+    console.error("Failed to merge MultiPolygon parts:", e);
+    return null;
+  }
+}
+
+/**
  * Normalize drawing parts into the correct GeoJSON geometry.
  *
  * - 1 line part  → LineString

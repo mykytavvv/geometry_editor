@@ -49,12 +49,12 @@ const DRAW_STYLES = [
     filter: ["all", ["==", "$type", "Point"], ["==", "meta", "midpoint"]],
     paint: { "circle-radius": 3, "circle-color": "#3d6b4f" },
   },
-  // Point
+  // Point – hidden because we render points via custom map layers (facility pins, etc.)
   {
     id: "gl-draw-point",
     type: "circle",
     filter: ["all", ["==", "$type", "Point"], ["==", "meta", "feature"], ["!=", "mode", "static"]],
-    paint: { "circle-radius": 6, "circle-color": "#3d6b4f" },
+    paint: { "circle-radius": 0, "circle-color": "#3d6b4f", "circle-opacity": 0 },
   },
 ];
 
@@ -268,6 +268,12 @@ export function useMapDraw({
         draw.changeMode("draw_line_string");
         break;
       case "draw_polygon":
+        // draw_polygon is handled by the custom continue-drawing system.
+        // Keep MapboxDraw in simple_select so it doesn't interfere.
+        try {
+          draw.changeMode("simple_select");
+        } catch { /* ignore */ }
+        break;
       case "draw_clip_polygon":
         draw.changeMode("draw_polygon");
         break;

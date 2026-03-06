@@ -250,3 +250,98 @@ export const MOCK_FEATURES: ParkFeatureCollection = {
     },
   ],
 };
+
+/**
+ * Mock data for Park Editor mode.
+ * A single park polygon centered around Chikusa Park.
+ */
+export const PARK_MOCK_FEATURES: ParkFeatureCollection = {
+  type: "FeatureCollection",
+  features: [
+    {
+      id: "park-boundary-1",
+      type: "Feature",
+      geometry: {
+        type: "Polygon",
+        coordinates: [
+          [
+            [136.9345, 35.168],
+            [136.942, 35.168],
+            [136.943, 35.1665],
+            [136.943, 35.162],
+            [136.9415, 35.1605],
+            [136.936, 35.1605],
+            [136.934, 35.162],
+            [136.9338, 35.166],
+            [136.9345, 35.168],
+          ],
+        ],
+      },
+      properties: {
+        type: "polygon",
+        label: "千種公園",
+        layer: "park",
+      },
+    },
+  ],
+};
+
+/**
+ * Park boundary shown as non-editable background context in Facility Editor mode.
+ * Uses the same Chikusa Park shape so the facility point sits visually inside the park.
+ */
+export const FACILITY_PARK_BOUNDARY: ParkFeatureCollection = {
+  type: "FeatureCollection",
+  features: [
+    {
+      id: "facility-park-bg",
+      type: "Feature",
+      geometry: {
+        type: "Polygon",
+        coordinates: [
+          [
+            [136.9345, 35.168],
+            [136.942, 35.168],
+            [136.943, 35.1665],
+            [136.943, 35.162],
+            [136.9415, 35.1605],
+            [136.936, 35.1605],
+            [136.934, 35.162],
+            [136.9338, 35.166],
+            [136.9345, 35.168],
+          ],
+        ],
+      },
+      properties: {
+        type: "polygon",
+        label: "千種公園",
+        layer: "park",
+      },
+    },
+  ],
+};
+
+/**
+ * Mock data for Facility Editor mode.
+ * A single point representing a facility.
+ */
+export const FACILITY_MOCK_FEATURES: ParkFeatureCollection = {
+  type: "FeatureCollection",
+  features: [
+    {
+      id: "facility-point-1",
+      type: "Feature",
+      geometry: {
+        type: "Point",
+        coordinates: [136.9389, 35.1644],
+      },
+      properties: {
+        type: "point",
+        label: "施設ポイント",
+        icon: "marker",
+        size: 10,
+        layer: "facilities",
+      },
+    },
+  ],
+};

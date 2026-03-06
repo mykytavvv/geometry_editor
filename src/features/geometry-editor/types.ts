@@ -1,5 +1,8 @@
 import type { Point, LineString, MultiLineString, Polygon, MultiPolygon, Position } from "geojson";
 
+// ─── Editor Modes ────────────────────────────────────────────
+export type EditorMode = "full" | "park" | "facility";
+
 // ─── Tool Modes ──────────────────────────────────────────────
 export type ToolMode =
   | "select"
@@ -13,7 +16,8 @@ export type ToolMode =
   | "measure_distance"
   | "measure_area"
   | "coordinate_input"
-  | "draw_clip_polygon";
+  | "draw_clip_polygon"
+  | "merge_parts";
 
 // ─── Feature Types ───────────────────────────────────────────
 export type ParkFeatureType = "point" | "line" | "multiline" | "polygon" | "multipolygon" | "text";
@@ -23,15 +27,44 @@ export type ParkLayer = "park" | "facilities" | "draft";
 export type DrawingPartsType = "line" | "polygon";
 export type DrawingParts = Position[][] | Position[][][];
 
-// ─── Continue Drawing State ──────────────────────────────────
-export interface ContinueDrawingState {
+// ─── Edge Anchor Info ────────────────────────────────────────
+/** Describes a specific point on a polygon/line edge, used for edge splitting. */
+export interface EdgeAnchorInfo {
   featureId: string;
   partIndex: number | null;         // For Multi* types: which part
-  ringIndex: number;                // Which ring (0 for lines, 0+ for polygon holes)
-  vertexIndex: number;              // The vertex we're continuing from
-  insertDirection: "append" | "prepend"; // For lines: append at end or prepend at start
-  newVertices: Position[];          // Vertices placed so far (in drawing order)
-  geometryType: "line" | "polygon";
+  ringIndex: number;                // Which ring (0 for outer, 1+ for holes)
+  edgeStartIndex: number;           // Index of the start vertex of the edge
+  position: Position;               // The exact point on the edge
+  edgeT: number;                    // Parametric position along the edge (0..1)
+}
+
+/** Describes a specific vertex on a polygon/line, used as an anchor point. */
+export interface VertexAnchorInfo {
+  featureId: string;
+  partIndex: number | null;
+  ringIndex: number;
+  vertexIndex: number;
+  position: Position;
+}
+
+// ─── Continue Drawing State ──────────────────────────────────
+export interface ContinueDrawingState {
+  /** How the drawing was started */
+  anchorType: "vertex" | "edge" | "free";
+  /** Vertex anchor info (when anchorType === "vertex") */
+  anchorVertex: VertexAnchorInfo | null;
+  /** Edge anchor info (when anchorType === "edge") */
+  anchorEdge: EdgeAnchorInfo | null;
+  /** Free-space anchor position (when anchorType === "free") */
+  anchorPosition: Position | null;
+  /** Vertices placed so far (in drawing order, not including anchor) */
+  newVertices: Position[];
+  /** How the drawing was finished (set when finish is triggered) */
+  finishType: "vertex" | "edge" | "free" | null;
+  /** Vertex info for finish point (when finishType === "vertex") */
+  finishVertex: VertexAnchorInfo | null;
+  /** Edge info for finish point (when finishType === "edge") */
+  finishEdge: EdgeAnchorInfo | null;
 }
 
 export interface ParkFeatureProperties {
@@ -87,6 +120,7 @@ export interface EditorState {
   drawingParts: DrawingParts | null; // accumulated multi-part coordinates
   drawingPartsType: DrawingPartsType | null; // what kind of multi-part drawing
   continueDrawingState: ContinueDrawingState | null; // active continue-drawing session
+  selectedPartIndices: number[]; // For MultiPolygon part selection (park mode)
 }
 
 // ─── Editor Actions ──────────────────────────────────────────
@@ -122,8 +156,11 @@ export type EditorAction =
   | { type: "FINISH_MULTI_DRAWING" }
   | { type: "CLEAR_DRAWING_PARTS" }
   | { type: "BULK_UPDATE_PROPERTIES"; ids: string[]; properties: Partial<ParkFeatureProperties> }
-  | { type: "START_CONTINUE_DRAWING"; featureId: string; partIndex: number | null; ringIndex: number; vertexIndex: number; geometryType: "line" | "polygon"; insertDirection: "append" | "prepend" }
+  | { type: "START_CONTINUE_DRAWING"; anchorType: "vertex" | "edge" | "free"; anchorVertex: VertexAnchorInfo | null; anchorEdge: EdgeAnchorInfo | null; anchorPosition: Position | null }
   | { type: "ADD_CONTINUE_VERTEX"; position: Position }
   | { type: "UNDO_CONTINUE_VERTEX" }
-  | { type: "FINISH_CONTINUE_DRAWING" }
-  | { type: "CANCEL_CONTINUE_DRAWING" };
+  | { type: "FINISH_CONTINUE_DRAWING"; finishType: "vertex" | "edge" | "free"; finishVertex: VertexAnchorInfo | null; finishEdge: EdgeAnchorInfo | null }
+  | { type: "CANCEL_CONTINUE_DRAWING" }
+  | { type: "APPEND_POLYGON_TO_FEATURE"; featureId: string; coordinates: Position[][] }
+  | { type: "SELECT_PARTS"; featureId: string; partIndices: number[] }
+  | { type: "MERGE_PARTS"; featureId: string; partIndices: number[] };

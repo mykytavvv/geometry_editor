@@ -13,10 +13,13 @@ import type {
   DrawingPartsType,
   DrawingParts,
   ContinueDrawingState,
+  EdgeAnchorInfo,
+  VertexAnchorInfo,
 } from "../types";
-import type { Position } from "geojson";
+import type { Position, Polygon, MultiPolygon } from "geojson";
+import * as turf from "@turf/turf";
 import { MAX_UNDO_STACK } from "../constants";
-import { duplicateFeature, mergePolygons, mergeLines, normalizeDrawingParts } from "../lib/geometry-ops";
+import { duplicateFeature, mergePolygons, mergeLines, normalizeDrawingParts, mergeMultiPolygonParts, normalizeToPolygonGeometry } from "../lib/geometry-ops";
 import { v4 as uuidv4 } from "uuid";
 
 // ─── Helpers ─────────────────────────────────────────────────
@@ -39,6 +42,77 @@ function pushUndo(
   };
 }
 
+// ─── Edge splitting helpers ──────────────────────────────────
+
+/**
+ * Insert a new vertex into a feature's ring at the specified edge position.
+ * Mutates the features collection in-place.
+ */
+function splitEdgeInFeatures(
+  features: ParkFeatureCollection,
+  edgeInfo: EdgeAnchorInfo,
+): void {
+  const feat = features.features.find((f) => f.id === edgeInfo.featureId);
+  if (!feat) return;
+
+  const geomType = feat.geometry.type;
+  const insertIdx = edgeInfo.edgeStartIndex + 1;
+
+  if (geomType === "Polygon") {
+    const rings = feat.geometry.coordinates as Position[][];
+    const ring = rings[edgeInfo.ringIndex];
+    if (ring) {
+      ring.splice(insertIdx, 0, edgeInfo.position);
+    }
+  } else if (geomType === "MultiPolygon" && edgeInfo.partIndex !== null) {
+    const parts = feat.geometry.coordinates as Position[][][];
+    const ring = parts[edgeInfo.partIndex]?.[edgeInfo.ringIndex];
+    if (ring) {
+      ring.splice(insertIdx, 0, edgeInfo.position);
+    }
+  } else if (geomType === "LineString") {
+    const coords = feat.geometry.coordinates as Position[];
+    coords.splice(insertIdx, 0, edgeInfo.position);
+  } else if (geomType === "MultiLineString" && edgeInfo.partIndex !== null) {
+    const parts = feat.geometry.coordinates as Position[][];
+    const part = parts[edgeInfo.partIndex];
+    if (part) {
+      part.splice(insertIdx, 0, edgeInfo.position);
+    }
+  }
+}
+
+/**
+ * If both anchor and finish are edge snaps on the same ring, the finish
+ * edge index may need to be adjusted because the anchor split already
+ * inserted a vertex before it.
+ */
+function adjustEdgeAfterSplit(
+  finishEdge: EdgeAnchorInfo,
+  anchorEdge: EdgeAnchorInfo | null,
+): EdgeAnchorInfo {
+  if (!anchorEdge) return finishEdge;
+
+  // Only adjust if same feature, same part, same ring
+  if (
+    finishEdge.featureId !== anchorEdge.featureId ||
+    finishEdge.partIndex !== anchorEdge.partIndex ||
+    finishEdge.ringIndex !== anchorEdge.ringIndex
+  ) {
+    return finishEdge;
+  }
+
+  // If finish edge start index is after the anchor split point, shift by 1
+  if (finishEdge.edgeStartIndex > anchorEdge.edgeStartIndex) {
+    return {
+      ...finishEdge,
+      edgeStartIndex: finishEdge.edgeStartIndex + 1,
+    };
+  }
+
+  return finishEdge;
+}
+
 // ─── Reducer ─────────────────────────────────────────────────
 function editorReducer(state: EditorState, action: EditorAction): EditorState {
   switch (action.type) {
@@ -52,6 +126,9 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         // Cancel continue drawing when switching to a different tool
         continueDrawingState:
           action.tool !== "continue_drawing" ? null : state.continueDrawingState,
+        // Clear part selection when entering or leaving merge_parts mode
+        selectedPartIndices:
+          action.tool !== "merge_parts" ? [] : state.selectedPartIndices,
         // Auto-open right panel on select tool if features are selected
         rightPanelOpen:
           action.tool === "select" && state.selectedFeatureIds.length > 0
@@ -121,6 +198,7 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
       return {
         ...state,
         selectedFeatureIds: action.ids,
+        selectedPartIndices: [],
         rightPanelOpen: action.ids.length > 0 ? true : state.rightPanelOpen,
       };
 
@@ -147,6 +225,7 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         redoStack: [...state.redoStack, cloneCollection(state.features)],
         features: prev,
         selectedFeatureIds: [],
+        selectedPartIndices: [],
         vertexEditFeatureId: null,
         vertexEditPartIndex: null,
         continueDrawingState: null,
@@ -164,6 +243,7 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         undoStack: [...state.undoStack, cloneCollection(state.features)],
         features: next,
         selectedFeatureIds: [],
+        selectedPartIndices: [],
         vertexEditFeatureId: null,
         vertexEditPartIndex: null,
         continueDrawingState: null,
@@ -182,6 +262,7 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         ...state,
         features: cloneCollection(state.savedSnapshot),
         selectedFeatureIds: [],
+        selectedPartIndices: [],
         undoStack: [],
         redoStack: [],
         activeTool: "select",
@@ -308,6 +389,7 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         features: cloneCollection(loaded),
         savedSnapshot: cloneCollection(loaded),
         selectedFeatureIds: [],
+        selectedPartIndices: [],
         undoStack: [],
         redoStack: [],
         parkVisibility: Object.fromEntries(
@@ -453,23 +535,25 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         drawingPartsType: null,
       };
 
-    // ── Continue Drawing ────────────────────────────────────
+    // ── Continue Drawing (flexible polygon drawing) ────────
     case "START_CONTINUE_DRAWING": {
+      const anchorFeatureId = action.anchorVertex?.featureId ?? action.anchorEdge?.featureId ?? null;
       return {
         ...state,
         activeTool: "continue_drawing",
         vertexEditFeatureId: null,
         vertexEditPartIndex: null,
         continueDrawingState: {
-          featureId: action.featureId,
-          partIndex: action.partIndex,
-          ringIndex: action.ringIndex,
-          vertexIndex: action.vertexIndex,
-          insertDirection: action.insertDirection,
+          anchorType: action.anchorType,
+          anchorVertex: action.anchorVertex,
+          anchorEdge: action.anchorEdge,
+          anchorPosition: action.anchorPosition,
           newVertices: [],
-          geometryType: action.geometryType,
+          finishType: null,
+          finishVertex: null,
+          finishEdge: null,
         },
-        selectedFeatureIds: [action.featureId],
+        selectedFeatureIds: anchorFeatureId ? [anchorFeatureId] : [],
       };
     }
 
@@ -502,80 +586,173 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
         return {
           ...state,
           continueDrawingState: null,
-          activeTool: "select",
+          activeTool: "draw_polygon",
         };
       }
 
-      const feat = state.features.features.find((f) => f.id === cds.featureId);
-      if (!feat) {
-        return { ...state, continueDrawingState: null, activeTool: "select" };
+      // Get anchor position
+      const anchorPos = cds.anchorType === "vertex"
+        ? cds.anchorVertex?.position
+        : cds.anchorType === "edge"
+          ? cds.anchorEdge?.position
+          : cds.anchorPosition;
+
+      if (!anchorPos) {
+        return { ...state, continueDrawingState: null, activeTool: "draw_polygon" };
       }
 
-      const nextFeatures = cloneCollection(state.features);
-      const idx = nextFeatures.features.findIndex((f) => f.id === cds.featureId);
-      if (idx < 0) {
-        return { ...state, continueDrawingState: null, activeTool: "select" };
+      // Get finish info from the action
+      const finishType = action.finishType;
+      const finishVertex = action.finishVertex;
+      const finishEdge = action.finishEdge;
+
+      // Get finish position
+      const finishPos = finishType === "vertex"
+        ? finishVertex?.position
+        : finishType === "edge"
+          ? finishEdge?.position
+          : null;
+
+      // Determine which features are involved
+      const anchorFeatureId = cds.anchorVertex?.featureId ?? cds.anchorEdge?.featureId ?? null;
+      const finishFeatureId = finishVertex?.featureId ?? finishEdge?.featureId ?? null;
+
+      // Build the polygon path: anchor → newVertices → (finishPos if not free)
+      const pathPoints: Position[] = [anchorPos, ...cds.newVertices];
+      if (finishPos) {
+        pathPoints.push(finishPos);
       }
+
+      // Close the path to form a polygon
+      // Close back to anchor to form a ring
+      const ring: Position[] = [...pathPoints, [...anchorPos]];
+
+      // Determine if both ends connect to the same feature
+      const sameFeature = anchorFeatureId && finishFeatureId && anchorFeatureId === finishFeatureId;
+      const hasAnyConnection = anchorFeatureId || finishFeatureId;
+      const connectedFeatureId = anchorFeatureId ?? finishFeatureId;
+
+      const nextFeatures = cloneCollection(state.features);
+
+      try {
+        // First: apply edge splits to the existing features if needed
+        if (cds.anchorType === "edge" && cds.anchorEdge) {
+          splitEdgeInFeatures(nextFeatures, cds.anchorEdge);
+        }
+        if (finishType === "edge" && finishEdge) {
+          // Need to adjust indices if the same ring was already split by anchor
+          const adjustedFinishEdge = adjustEdgeAfterSplit(
+            finishEdge,
+            cds.anchorType === "edge" ? cds.anchorEdge : null,
+          );
+          splitEdgeInFeatures(nextFeatures, adjustedFinishEdge);
+        }
+
+        // Build the new polygon from the drawn path
+        const newPolygon = turf.polygon([ring]);
+
+        if (hasAnyConnection && connectedFeatureId) {
+          // Union with the connected feature
+          const targetIdx = nextFeatures.features.findIndex((f) => f.id === connectedFeatureId);
+          if (targetIdx >= 0) {
+            const targetFeature = nextFeatures.features[targetIdx];
+            const targetGeomType = targetFeature.geometry.type;
+
+            if (targetGeomType === "Polygon" || targetGeomType === "MultiPolygon") {
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const targetTurf: any = targetGeomType === "Polygon"
+                ? turf.polygon((targetFeature.geometry as Polygon).coordinates)
+                : turf.multiPolygon((targetFeature.geometry as MultiPolygon).coordinates);
+
+              const unionResult = turf.union(
+                turf.featureCollection([targetTurf, newPolygon])
+              );
+
+              if (unionResult) {
+                const normalizedGeom = normalizeToPolygonGeometry(unionResult.geometry);
+                if (normalizedGeom) {
+                  nextFeatures.features[targetIdx] = {
+                    ...targetFeature,
+                    geometry: normalizedGeom,
+                    properties: {
+                      ...targetFeature.properties,
+                      type: normalizedGeom.type === "MultiPolygon" ? "multipolygon" : "polygon",
+                    },
+                  };
+
+                  return {
+                    ...state,
+                    ...pushUndo(state, nextFeatures),
+                    continueDrawingState: null,
+                    activeTool: "draw_polygon",
+                    selectedFeatureIds: [connectedFeatureId],
+                  };
+                }
+              }
+            }
+          }
+        }
+
+        // No connection or union failed — create as standalone polygon
+        // (This also handles the "free" start/end case)
+        const newFeature: ParkFeature = {
+          id: uuidv4(),
+          type: "Feature",
+          geometry: { type: "Polygon", coordinates: [ring] },
+          properties: {
+            type: "polygon",
+            layer: "draft",
+          },
+        };
+
+        nextFeatures.features.push(newFeature);
+
+        return {
+          ...state,
+          ...pushUndo(state, nextFeatures),
+          continueDrawingState: null,
+          activeTool: "draw_polygon",
+          selectedFeatureIds: [newFeature.id],
+        };
+      } catch (e) {
+        console.error("Failed to finish continue drawing:", e);
+        return {
+          ...state,
+          continueDrawingState: null,
+          activeTool: "draw_polygon",
+        };
+      }
+    }
+
+    case "CANCEL_CONTINUE_DRAWING":
+      return {
+        ...state,
+        continueDrawingState: null,
+        activeTool: "draw_polygon",
+      };
+
+    case "APPEND_POLYGON_TO_FEATURE": {
+      const { featureId, coordinates } = action;
+      const nextFeatures = cloneCollection(state.features);
+      const idx = nextFeatures.features.findIndex((f) => f.id === featureId);
+      if (idx < 0) return state;
 
       const target = nextFeatures.features[idx];
       const geomType = target.geometry.type;
 
-      if (cds.geometryType === "line") {
-        // ── Line: append or prepend new vertices ──
-        let coords: Position[];
-        if (geomType === "LineString") {
-          coords = [...(target.geometry.coordinates as Position[])];
-        } else if (geomType === "MultiLineString" && cds.partIndex !== null) {
-          coords = [...((target.geometry.coordinates as Position[][])[cds.partIndex])];
-        } else {
-          return { ...state, continueDrawingState: null, activeTool: "select" };
-        }
-
-        if (cds.insertDirection === "append") {
-          coords.push(...cds.newVertices);
-        } else {
-          // prepend: newVertices were drawn "outward" from the start vertex,
-          // so reverse them to get the correct order
-          coords.unshift(...[...cds.newVertices].reverse());
-        }
-
-        if (geomType === "LineString") {
-          target.geometry = { type: "LineString", coordinates: coords };
-        } else {
-          const allParts = target.geometry.coordinates as Position[][];
-          allParts[cds.partIndex!] = coords;
-          target.geometry = { type: "MultiLineString", coordinates: allParts };
-        }
+      if (geomType === "Polygon") {
+        const newCoords: Position[][][] = [
+          target.geometry.coordinates as Position[][],
+          coordinates,
+        ];
+        target.geometry = { type: "MultiPolygon", coordinates: newCoords };
+        target.properties.type = "multipolygon";
+      } else if (geomType === "MultiPolygon") {
+        const allParts = target.geometry.coordinates as Position[][][];
+        allParts.push(coordinates);
+        target.geometry = { type: "MultiPolygon", coordinates: allParts };
       } else {
-        // ── Polygon: insert new vertices after the selected vertex ──
-        let rings: Position[][];
-        if (geomType === "Polygon") {
-          rings = JSON.parse(JSON.stringify(target.geometry.coordinates)) as Position[][];
-        } else if (geomType === "MultiPolygon" && cds.partIndex !== null) {
-          rings = JSON.parse(JSON.stringify((target.geometry.coordinates as Position[][][])[cds.partIndex])) as Position[][];
-        } else {
-          return { ...state, continueDrawingState: null, activeTool: "select" };
-        }
-
-        const ring = rings[cds.ringIndex];
-        if (!ring) {
-          return { ...state, continueDrawingState: null, activeTool: "select" };
-        }
-
-        // Insert after vertexIndex (splice into the ring before the closing vertex)
-        // For a polygon ring: [v0, v1, v2, ..., vN, v0] (closed)
-        const insertAt = cds.vertexIndex + 1;
-        ring.splice(insertAt, 0, ...cds.newVertices);
-        // Fix closure
-        ring[ring.length - 1] = [...ring[0]];
-
-        if (geomType === "Polygon") {
-          target.geometry = { type: "Polygon", coordinates: rings };
-        } else {
-          const allParts = target.geometry.coordinates as Position[][][];
-          allParts[cds.partIndex!] = rings;
-          target.geometry = { type: "MultiPolygon", coordinates: allParts };
-        }
+        return state;
       }
 
       nextFeatures.features[idx] = target;
@@ -583,18 +760,52 @@ function editorReducer(state: EditorState, action: EditorAction): EditorState {
       return {
         ...state,
         ...pushUndo(state, nextFeatures),
-        continueDrawingState: null,
-        activeTool: "select",
-        selectedFeatureIds: [cds.featureId],
+        selectedFeatureIds: [featureId],
       };
     }
 
-    case "CANCEL_CONTINUE_DRAWING":
+    case "SELECT_PARTS": {
       return {
         ...state,
-        continueDrawingState: null,
-        activeTool: "select",
+        selectedFeatureIds: [action.featureId],
+        selectedPartIndices: action.partIndices,
+        rightPanelOpen: true,
       };
+    }
+
+    case "MERGE_PARTS": {
+      const { featureId, partIndices } = action;
+      if (partIndices.length < 2) return state;
+
+      const feat = state.features.features.find((f) => f.id === featureId);
+      if (!feat || feat.geometry.type !== "MultiPolygon") return state;
+
+      const result = mergeMultiPolygonParts(
+        feat.geometry as import("geojson").MultiPolygon,
+        partIndices
+      );
+      if (!result) return state;
+
+      const nextFeatures = cloneCollection(state.features);
+      const idx = nextFeatures.features.findIndex((f) => f.id === featureId);
+      if (idx < 0) return state;
+
+      nextFeatures.features[idx] = {
+        ...nextFeatures.features[idx],
+        geometry: result.geometry,
+        properties: {
+          ...nextFeatures.features[idx].properties,
+          type: result.featureType,
+        },
+      };
+
+      return {
+        ...state,
+        ...pushUndo(state, nextFeatures),
+        selectedFeatureIds: [featureId],
+        selectedPartIndices: [],
+      };
+    }
 
     default:
       return state;
@@ -632,6 +843,7 @@ export function useEditorState(initialFeatures: ParkFeatureCollection) {
     drawingParts: null,
     drawingPartsType: null,
     continueDrawingState: null,
+    selectedPartIndices: [],
   };
 
   const [state, dispatch] = useReducer(editorReducer, initialState);
@@ -805,8 +1017,8 @@ export function useEditorState(initialFeatures: ParkFeatureCollection) {
   );
 
   const startContinueDrawing = useCallback(
-    (featureId: string, partIndex: number | null, ringIndex: number, vertexIndex: number, geometryType: "line" | "polygon", insertDirection: "append" | "prepend") =>
-      dispatch({ type: "START_CONTINUE_DRAWING", featureId, partIndex, ringIndex, vertexIndex, geometryType, insertDirection }),
+    (anchorType: "vertex" | "edge" | "free", anchorVertex: VertexAnchorInfo | null, anchorEdge: EdgeAnchorInfo | null, anchorPosition: Position | null) =>
+      dispatch({ type: "START_CONTINUE_DRAWING", anchorType, anchorVertex, anchorEdge, anchorPosition }),
     []
   );
 
@@ -821,12 +1033,31 @@ export function useEditorState(initialFeatures: ParkFeatureCollection) {
   );
 
   const finishContinueDrawing = useCallback(
-    () => dispatch({ type: "FINISH_CONTINUE_DRAWING" }),
+    (finishType: "vertex" | "edge" | "free", finishVertex: VertexAnchorInfo | null, finishEdge: EdgeAnchorInfo | null) =>
+      dispatch({ type: "FINISH_CONTINUE_DRAWING", finishType, finishVertex, finishEdge }),
     []
   );
 
   const cancelContinueDrawing = useCallback(
     () => dispatch({ type: "CANCEL_CONTINUE_DRAWING" }),
+    []
+  );
+
+  const appendPolygonToFeature = useCallback(
+    (featureId: string, coordinates: Position[][]) =>
+      dispatch({ type: "APPEND_POLYGON_TO_FEATURE", featureId, coordinates }),
+    []
+  );
+
+  const selectParts = useCallback(
+    (featureId: string, partIndices: number[]) =>
+      dispatch({ type: "SELECT_PARTS", featureId, partIndices }),
+    []
+  );
+
+  const mergeParts = useCallback(
+    (featureId: string, partIndices: number[]) =>
+      dispatch({ type: "MERGE_PARTS", featureId, partIndices }),
     []
   );
 
@@ -916,6 +1147,9 @@ export function useEditorState(initialFeatures: ParkFeatureCollection) {
     undoContinueVertex,
     finishContinueDrawing,
     cancelContinueDrawing,
+    appendPolygonToFeature,
+    selectParts,
+    mergeParts,
     // Derived
     selectedFeatures,
     canUndo,

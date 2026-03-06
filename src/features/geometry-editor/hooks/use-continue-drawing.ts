@@ -4,7 +4,12 @@ import { useEffect, useRef, useCallback } from "react";
 import maplibregl from "maplibre-gl";
 import type { Map as MaplibreMap, MapMouseEvent, GeoJSONSource } from "maplibre-gl";
 import type { Position } from "geojson";
-import type { ParkFeature, ParkFeatureCollection, ContinueDrawingState } from "../types";
+import type {
+  ParkFeatureCollection,
+  ContinueDrawingState,
+  VertexAnchorInfo,
+  EdgeAnchorInfo,
+} from "../types";
 import {
   CONTINUE_DRAW_SOURCE_ID,
   CONTINUE_DRAW_EXISTING_LINE_LAYER,
@@ -13,156 +18,224 @@ import {
   CONTINUE_DRAW_RUBBERBAND_SOURCE_ID,
   CONTINUE_DRAW_RUBBERBAND_LAYER,
   CONTINUE_DRAW_SNAP_INDICATOR_LAYER,
+  CONTINUE_DRAW_EDGE_HIGHLIGHT_LAYER,
   SNAP_THRESHOLD_PX,
 } from "../constants";
-import { findNearestVertex, type ProjectFn, type SnapResult } from "../lib/snapping";
+import {
+  findNearestVertex,
+  findNearestEdge,
+  type ProjectFn,
+  type EdgeSnapResult,
+} from "../lib/snapping";
 
 // ─── Types ──────────────────────────────────────────────────
 
 interface UseContinueDrawingProps {
   map: MaplibreMap | null;
   mapLoaded: boolean;
+  /** The continue drawing state — null means inactive */
   continueDrawingState: ContinueDrawingState | null;
-  feature: ParkFeature | null; // The feature being extended
+  /** All features for snapping */
   allFeatures: ParkFeatureCollection;
   snappingEnabled: boolean;
+  /** Callback when a new vertex is placed */
   onAddVertex: (position: Position) => void;
+  /** Callback to undo the last vertex */
   onUndoVertex: () => void;
-  onFinish: () => void;
+  /** Callback to finish drawing — receives finish info */
+  onFinish: (finishType: "vertex" | "edge" | "free", finishVertex: VertexAnchorInfo | null, finishEdge: EdgeAnchorInfo | null) => void;
+  /** Callback to cancel drawing */
   onCancel: () => void;
 }
 
-// ─── Helpers ────────────────────────────────────────────────
+// ─── Snap helper ────────────────────────────────────────────
 
-/**
- * Get the coordinates of the existing part being extended.
- * Returns the relevant line or polygon ring coordinates.
- */
-function getExistingCoords(feature: ParkFeature, cds: ContinueDrawingState): Position[] | null {
-  const geomType = feature.geometry.type;
-
-  if (geomType === "LineString") {
-    return feature.geometry.coordinates as Position[];
-  }
-  if (geomType === "MultiLineString" && cds.partIndex !== null) {
-    const parts = feature.geometry.coordinates as Position[][];
-    return parts[cds.partIndex] ?? null;
-  }
-  if (geomType === "Polygon") {
-    const rings = feature.geometry.coordinates as Position[][];
-    return rings[cds.ringIndex] ?? null;
-  }
-  if (geomType === "MultiPolygon" && cds.partIndex !== null) {
-    const parts = feature.geometry.coordinates as Position[][][];
-    const rings = parts[cds.partIndex];
-    return rings?.[cds.ringIndex] ?? null;
-  }
-  return null;
+interface SnapInfo {
+  position: Position;
+  snapType: "vertex" | "edge" | "none";
+  featureId?: string;
+  /** Vertex info if snapped to vertex */
+  vertexInfo: VertexAnchorInfo | null;
+  /** Edge info if snapped to edge */
+  edgeInfo: EdgeAnchorInfo | null;
 }
 
 /**
- * Build the anchor point — the vertex from which drawing continues.
- * For lines: the first or last vertex depending on insertDirection.
- * For polygons: the selected vertex.
- */
-function getAnchorPoint(existingCoords: Position[], cds: ContinueDrawingState): Position {
-  if (cds.geometryType === "line") {
-    return cds.insertDirection === "append"
-      ? existingCoords[existingCoords.length - 1]
-      : existingCoords[0];
-  }
-  // Polygon: the selected vertex
-  return existingCoords[cds.vertexIndex];
-}
-
-/**
- * For polygons, get the "target" point — the next vertex after the insertion point,
- * which is where the new path should reconnect.
- */
-function getPolygonTargetPoint(existingCoords: Position[], cds: ContinueDrawingState): Position | null {
-  if (cds.geometryType !== "polygon") return null;
-  // Ring is closed: [v0, v1, ..., vN, v0]
-  const vertexCount = existingCoords.length - 1; // exclude closing vertex
-  const nextIdx = (cds.vertexIndex + 1) % vertexCount;
-  return existingCoords[nextIdx];
-}
-
-/**
- * Check if a position matches the anchor point (the vertex we're drawing from).
- * We don't want to snap-to-finish on the anchor itself.
- */
-function isAnchorPosition(pos: Position, anchor: Position): boolean {
-  return pos[0] === anchor[0] && pos[1] === anchor[1];
-}
-
-/**
- * Perform snapping, including same-feature vertices.
- * Returns the snap result and whether it's a same-feature vertex (snap-to-finish candidate).
+ * Perform combined vertex + edge snapping for the drawing system.
+ * Vertex snap is preferred when distances are close.
  */
 function performSnap(
   cursorPos: Position,
   allFeatures: ParkFeatureCollection,
-  featureId: string,
-  anchor: Position,
   map: MaplibreMap,
-): { position: Position; isSameFeatureVertex: boolean } {
+): SnapInfo {
   const project: ProjectFn = (lngLat) => {
     const p = map.project(lngLat);
     return { x: p.x, y: p.y };
   };
 
-  // Snap to ALL features (no exclusion)
-  const result: SnapResult = findNearestVertex(
+  // Try vertex snap first
+  const vertexResult = findNearestVertex(
     cursorPos,
     allFeatures,
     project,
     SNAP_THRESHOLD_PX,
   );
 
-  if (result.snapped) {
-    const isSameFeature = result.featureId === featureId;
-    const isAnchor = isAnchorPosition(result.snapped, anchor);
+  // Try edge snap
+  const edgeResult: EdgeSnapResult = findNearestEdge(
+    cursorPos,
+    allFeatures,
+    project,
+    SNAP_THRESHOLD_PX,
+  );
 
-    // If it's the anchor vertex, don't snap to it — treat as no snap
-    if (isSameFeature && isAnchor) {
-      return { position: cursorPos, isSameFeatureVertex: false };
+  // Vertex priority: prefer vertex if within 3px of edge distance
+  const VERTEX_PRIORITY_PX = 3;
+
+  if (vertexResult.snapped && edgeResult.snapped) {
+    if (vertexResult.distancePx <= edgeResult.distancePx + VERTEX_PRIORITY_PX) {
+      return buildVertexSnapInfo(
+        { snapped: vertexResult.snapped, featureId: vertexResult.featureId, distancePx: vertexResult.distancePx },
+        allFeatures,
+      );
     }
+    return buildEdgeSnapInfo(edgeResult);
+  }
 
-    return {
+  if (vertexResult.snapped) {
+    return buildVertexSnapInfo(
+      { snapped: vertexResult.snapped, featureId: vertexResult.featureId, distancePx: vertexResult.distancePx },
+      allFeatures,
+    );
+  }
+
+  if (edgeResult.snapped) {
+    return buildEdgeSnapInfo(edgeResult);
+  }
+
+  return {
+    position: cursorPos,
+    snapType: "none",
+    vertexInfo: null,
+    edgeInfo: null,
+  };
+}
+
+function buildVertexSnapInfo(
+  result: { snapped: Position; featureId?: string; distancePx: number },
+  allFeatures: ParkFeatureCollection,
+): SnapInfo {
+  // We need to find the exact vertex index in the feature
+  const feature = allFeatures.features.find((f) => f.id === result.featureId);
+  let vertexInfo: VertexAnchorInfo | null = null;
+
+  if (feature && result.snapped) {
+    vertexInfo = findVertexInFeature(feature, result.snapped);
+  }
+
+  return {
+    position: result.snapped!,
+    snapType: "vertex",
+    featureId: result.featureId,
+    vertexInfo,
+    edgeInfo: null,
+  };
+}
+
+function buildEdgeSnapInfo(result: EdgeSnapResult): SnapInfo {
+  let edgeInfo: EdgeAnchorInfo | null = null;
+
+  if (result.snapped && result.featureId && result.edgeStartIndex !== undefined && result.edgeT !== undefined) {
+    edgeInfo = {
+      featureId: result.featureId,
+      partIndex: result.partIndex ?? null,
+      ringIndex: result.ringIndex ?? 0,
+      edgeStartIndex: result.edgeStartIndex,
       position: result.snapped,
-      isSameFeatureVertex: isSameFeature,
+      edgeT: result.edgeT,
     };
   }
 
-  return { position: cursorPos, isSameFeatureVertex: false };
+  return {
+    position: result.snapped!,
+    snapType: "edge",
+    featureId: result.featureId,
+    vertexInfo: null,
+    edgeInfo,
+  };
 }
 
 /**
- * Build GeoJSON for the continue drawing overlay.
+ * Find the vertex index info for a position that exactly matches a vertex in a feature.
  */
-function buildOverlayData(
-  existingCoords: Position[],
-  cds: ContinueDrawingState,
-) {
-  const features: GeoJSON.Feature[] = [];
-  const anchor = getAnchorPoint(existingCoords, cds);
+function findVertexInFeature(
+  feature: import("../types").ParkFeature,
+  position: Position,
+): VertexAnchorInfo | null {
+  const geom = feature.geometry;
 
-  // 1. Show the existing geometry outline (dimmed)
-  if (cds.geometryType === "line") {
-    features.push({
-      type: "Feature",
-      geometry: { type: "LineString", coordinates: existingCoords },
-      properties: { role: "existing" },
-    });
-  } else {
-    features.push({
-      type: "Feature",
-      geometry: { type: "Polygon", coordinates: [existingCoords] },
-      properties: { role: "existing" },
-    });
+  const match = (v: Position) => v[0] === position[0] && v[1] === position[1];
+
+  switch (geom.type) {
+    case "Point":
+      if (match(geom.coordinates)) {
+        return { featureId: feature.id, partIndex: null, ringIndex: 0, vertexIndex: 0, position };
+      }
+      break;
+    case "LineString":
+      for (let i = 0; i < geom.coordinates.length; i++) {
+        if (match(geom.coordinates[i])) {
+          return { featureId: feature.id, partIndex: null, ringIndex: 0, vertexIndex: i, position };
+        }
+      }
+      break;
+    case "MultiLineString":
+      for (let p = 0; p < geom.coordinates.length; p++) {
+        for (let i = 0; i < geom.coordinates[p].length; i++) {
+          if (match(geom.coordinates[p][i])) {
+            return { featureId: feature.id, partIndex: p, ringIndex: 0, vertexIndex: i, position };
+          }
+        }
+      }
+      break;
+    case "Polygon":
+      for (let r = 0; r < geom.coordinates.length; r++) {
+        const ring = geom.coordinates[r];
+        // Skip closing vertex
+        for (let i = 0; i < ring.length - 1; i++) {
+          if (match(ring[i])) {
+            return { featureId: feature.id, partIndex: null, ringIndex: r, vertexIndex: i, position };
+          }
+        }
+      }
+      break;
+    case "MultiPolygon":
+      for (let p = 0; p < geom.coordinates.length; p++) {
+        for (let r = 0; r < geom.coordinates[p].length; r++) {
+          const ring = geom.coordinates[p][r];
+          for (let i = 0; i < ring.length - 1; i++) {
+            if (match(ring[i])) {
+              return { featureId: feature.id, partIndex: p, ringIndex: r, vertexIndex: i, position };
+            }
+          }
+        }
+      }
+      break;
   }
+  return null;
+}
 
-  // 2. The new path drawn so far
+// ─── Overlay builder ────────────────────────────────────────
+
+function buildOverlayData(cds: ContinueDrawingState) {
+  const features: GeoJSON.Feature[] = [];
+
+  // Get the anchor position
+  const anchor = getAnchorPosition(cds);
+  if (!anchor) return { type: "FeatureCollection" as const, features };
+
+  // 1. New path drawn so far
   if (cds.newVertices.length > 0) {
     const newPath = [anchor, ...cds.newVertices];
     features.push({
@@ -170,24 +243,9 @@ function buildOverlayData(
       geometry: { type: "LineString", coordinates: newPath },
       properties: { role: "new" },
     });
-
-    // For polygons: also show a "closing" line from the last new vertex to the target
-    if (cds.geometryType === "polygon") {
-      const target = getPolygonTargetPoint(existingCoords, cds);
-      if (target) {
-        features.push({
-          type: "Feature",
-          geometry: {
-            type: "LineString",
-            coordinates: [cds.newVertices[cds.newVertices.length - 1], target],
-          },
-          properties: { role: "closing" },
-        });
-      }
-    }
   }
 
-  // 3. Vertex handles for new vertices
+  // 2. Vertex handles for new vertices
   for (let i = 0; i < cds.newVertices.length; i++) {
     features.push({
       type: "Feature",
@@ -196,7 +254,7 @@ function buildOverlayData(
     });
   }
 
-  // 4. Anchor point (highlight)
+  // 3. Anchor point (highlight)
   features.push({
     type: "Feature",
     geometry: { type: "Point", coordinates: anchor },
@@ -206,10 +264,22 @@ function buildOverlayData(
   return { type: "FeatureCollection" as const, features };
 }
 
+function getAnchorPosition(cds: ContinueDrawingState): Position | null {
+  switch (cds.anchorType) {
+    case "vertex":
+      return cds.anchorVertex?.position ?? null;
+    case "edge":
+      return cds.anchorEdge?.position ?? null;
+    case "free":
+      return cds.anchorPosition ?? null;
+  }
+}
+
 // ─── Layer cleanup ──────────────────────────────────────────
 
 function cleanupLayers(map: MaplibreMap) {
   const layers = [
+    CONTINUE_DRAW_EDGE_HIGHLIGHT_LAYER,
     CONTINUE_DRAW_SNAP_INDICATOR_LAYER,
     CONTINUE_DRAW_RUBBERBAND_LAYER,
     CONTINUE_DRAW_VERTEX_LAYER,
@@ -234,7 +304,6 @@ export function useContinueDrawing({
   map,
   mapLoaded,
   continueDrawingState,
-  feature,
   allFeatures,
   snappingEnabled,
   onAddVertex,
@@ -242,14 +311,12 @@ export function useContinueDrawing({
   onFinish,
   onCancel,
 }: UseContinueDrawingProps) {
-  const isActive = continueDrawingState !== null && feature !== null;
+  const isActive = continueDrawingState !== null;
   const isActiveRef = useRef(false);
   isActiveRef.current = isActive;
 
   const cdsRef = useRef(continueDrawingState);
   cdsRef.current = continueDrawingState;
-  const featureRef = useRef(feature);
-  featureRef.current = feature;
   const allFeaturesRef = useRef(allFeatures);
   allFeaturesRef.current = allFeatures;
   const snappingEnabledRef = useRef(snappingEnabled);
@@ -264,25 +331,19 @@ export function useContinueDrawing({
   const onCancelRef = useRef(onCancel);
   onCancelRef.current = onCancel;
 
-  // Track whether the cursor is currently snapped to a same-feature vertex
-  const snapToFinishRef = useRef(false);
+  // Track current snap state for click handler
+  const currentSnapRef = useRef<SnapInfo | null>(null);
 
   // ─── Setup / update layers ────────────────────────────
   useEffect(() => {
     if (!map || !mapLoaded) return;
 
-    if (!isActive || !continueDrawingState || !feature) {
+    if (!isActive || !continueDrawingState) {
       cleanupLayers(map);
       return;
     }
 
-    const existingCoords = getExistingCoords(feature, continueDrawingState);
-    if (!existingCoords) {
-      cleanupLayers(map);
-      return;
-    }
-
-    const data = buildOverlayData(existingCoords, continueDrawingState);
+    const data = buildOverlayData(continueDrawingState);
 
     // ── Create or update main source ──
     const source = map.getSource(CONTINUE_DRAW_SOURCE_ID) as GeoJSONSource | undefined;
@@ -294,7 +355,7 @@ export function useContinueDrawing({
         data,
       });
 
-      // Existing geometry outline (dimmed)
+      // Existing geometry outline (dimmed) - not used in new system but keep layer for consistency
       map.addLayer({
         id: CONTINUE_DRAW_EXISTING_LINE_LAYER,
         type: "line",
@@ -309,7 +370,7 @@ export function useContinueDrawing({
         },
       });
 
-      // New line being drawn + closing line for polygons
+      // New line being drawn
       map.addLayer({
         id: CONTINUE_DRAW_NEW_LINE_LAYER,
         type: "line",
@@ -320,7 +381,7 @@ export function useContinueDrawing({
           "line-color": [
             "case",
             ["==", ["get", "role"], "closing"], "#f59e0b",
-            "#22c55e",
+            "#3b82f6",
           ],
           "line-width": [
             "case",
@@ -349,13 +410,13 @@ export function useContinueDrawing({
           ],
           "circle-color": [
             "case",
-            ["==", ["get", "role"], "anchor"], "#f59e0b",
+            ["==", ["get", "role"], "anchor"], "#3b82f6",
             "#ffffff",
           ],
           "circle-stroke-color": [
             "case",
-            ["==", ["get", "role"], "anchor"], "#b45309",
-            "#22c55e",
+            ["==", ["get", "role"], "anchor"], "#1d4ed8",
+            "#3b82f6",
           ],
           "circle-stroke-width": 2,
         },
@@ -382,34 +443,47 @@ export function useContinueDrawing({
         filter: ["==", ["geometry-type"], "LineString"],
         layout: { "line-cap": "round", "line-join": "round" },
         paint: {
-          "line-color": "#22c55e",
+          "line-color": "#3b82f6",
           "line-width": 1.5,
           "line-dasharray": [4, 3],
           "line-opacity": 0.7,
         },
       });
 
-      // Snap-to-finish indicator circle (shown on same-feature vertex hover)
+      // Snap indicator circle (vertex or edge snap)
       map.addLayer({
         id: CONTINUE_DRAW_SNAP_INDICATOR_LAYER,
         type: "circle",
         source: CONTINUE_DRAW_RUBBERBAND_SOURCE_ID,
-        filter: ["==", ["geometry-type"], "Point"],
+        filter: ["all", ["==", ["geometry-type"], "Point"], ["==", ["get", "role"], "snap-target"]],
         paint: {
           "circle-radius": 9,
-          "circle-color": "#22c55e",
+          "circle-color": "#3b82f6",
           "circle-opacity": 0.25,
-          "circle-stroke-color": "#22c55e",
+          "circle-stroke-color": "#3b82f6",
           "circle-stroke-width": 2.5,
+        },
+      });
+
+      // Edge highlight line (when hovering over an edge)
+      map.addLayer({
+        id: CONTINUE_DRAW_EDGE_HIGHLIGHT_LAYER,
+        type: "line",
+        source: CONTINUE_DRAW_RUBBERBAND_SOURCE_ID,
+        filter: ["all", ["==", ["geometry-type"], "LineString"], ["==", ["get", "role"], "edge-highlight"]],
+        layout: { "line-cap": "round", "line-join": "round" },
+        paint: {
+          "line-color": "#f59e0b",
+          "line-width": 3,
+          "line-opacity": 0.8,
         },
       });
     }
 
     return () => {
-      // Don't cleanup on every re-render — only when truly deactivating
-      // The cleanup is handled by the isActive check at the top
+      // Cleanup handled by isActive check at top
     };
-  }, [map, mapLoaded, isActive, continueDrawingState, feature]);
+  }, [map, mapLoaded, isActive, continueDrawingState]);
 
   // ─── Cleanup on deactivation ──────────────────────────
   useEffect(() => {
@@ -425,30 +499,23 @@ export function useContinueDrawing({
     const handleMouseMove = (e: MapMouseEvent) => {
       if (!isActiveRef.current) return;
       const cds = cdsRef.current;
-      const feat = featureRef.current;
-      if (!cds || !feat) return;
+      if (!cds) return;
 
-      const existingCoords = getExistingCoords(feat, cds);
-      if (!existingCoords) return;
-
-      const anchor = getAnchorPoint(existingCoords, cds);
+      const anchor = getAnchorPosition(cds);
       let cursorPos: Position = [e.lngLat.lng, e.lngLat.lat];
-      let isSameFeatureVertex = false;
+      let snapInfo: SnapInfo = { position: cursorPos, snapType: "none", vertexInfo: null, edgeInfo: null };
 
-      // Snapping (includes same-feature vertices)
+      // Snapping
       if (snappingEnabledRef.current) {
-        const snapResult = performSnap(
+        snapInfo = performSnap(
           cursorPos,
           allFeaturesRef.current,
-          cds.featureId,
-          anchor,
           map,
         );
-        cursorPos = snapResult.position;
-        isSameFeatureVertex = snapResult.isSameFeatureVertex;
+        cursorPos = snapInfo.position;
       }
 
-      snapToFinishRef.current = isSameFeatureVertex;
+      currentSnapRef.current = snapInfo;
 
       // Get the tip point (last new vertex, or anchor if no new vertices yet)
       const tip = cds.newVertices.length > 0
@@ -456,20 +523,22 @@ export function useContinueDrawing({
         : anchor;
 
       // Build rubberband features
-      const rbFeatures: GeoJSON.Feature[] = [
+      const rbFeatures: GeoJSON.Feature[] = [];
+
+      if (tip) {
         // Rubberband line from tip to cursor
-        {
+        rbFeatures.push({
           type: "Feature",
           geometry: {
             type: "LineString",
             coordinates: [tip, cursorPos],
           },
-          properties: {},
-        },
-      ];
+          properties: { role: "rubberband" },
+        });
+      }
 
-      // If hovering over a same-feature vertex, show snap indicator
-      if (isSameFeatureVertex) {
+      // Snap indicator
+      if (snapInfo.snapType === "vertex") {
         rbFeatures.push({
           type: "Feature",
           geometry: {
@@ -478,6 +547,34 @@ export function useContinueDrawing({
           },
           properties: { role: "snap-target" },
         });
+      } else if (snapInfo.snapType === "edge" && snapInfo.edgeInfo) {
+        // Show point on edge
+        rbFeatures.push({
+          type: "Feature",
+          geometry: {
+            type: "Point",
+            coordinates: cursorPos,
+          },
+          properties: { role: "snap-target" },
+        });
+
+        // Highlight the edge being snapped to
+        const edgeFeature = allFeaturesRef.current.features.find(
+          (f) => f.id === snapInfo.edgeInfo!.featureId
+        );
+        if (edgeFeature) {
+          const edgeCoords = getEdgeCoordinates(edgeFeature, snapInfo.edgeInfo!);
+          if (edgeCoords) {
+            rbFeatures.push({
+              type: "Feature",
+              geometry: {
+                type: "LineString",
+                coordinates: edgeCoords,
+              },
+              properties: { role: "edge-highlight" },
+            });
+          }
+        }
       }
 
       // Update rubberband source
@@ -491,42 +588,41 @@ export function useContinueDrawing({
 
       // Update cursor style
       const canvas = map.getCanvasContainer();
-      canvas.style.cursor = isSameFeatureVertex ? "pointer" : "crosshair";
+      canvas.style.cursor = snapInfo.snapType !== "none" ? "pointer" : "crosshair";
     };
 
     const handleClick = (e: MapMouseEvent) => {
       if (!isActiveRef.current) return;
       const cds = cdsRef.current;
-      const feat = featureRef.current;
-      if (!cds || !feat) return;
+      if (!cds) return;
 
-      const existingCoords = getExistingCoords(feat, cds);
-      if (!existingCoords) return;
-
-      const anchor = getAnchorPoint(existingCoords, cds);
       let pos: Position = [e.lngLat.lng, e.lngLat.lat];
-      let isSameFeatureVertex = false;
+      let snapInfo: SnapInfo = { position: pos, snapType: "none", vertexInfo: null, edgeInfo: null };
 
-      // Snapping (includes same-feature vertices)
+      // Snapping
       if (snappingEnabledRef.current) {
-        const snapResult = performSnap(
+        snapInfo = performSnap(
           pos,
           allFeaturesRef.current,
-          cds.featureId,
-          anchor,
           map,
         );
-        pos = snapResult.position;
-        isSameFeatureVertex = snapResult.isSameFeatureVertex;
+        pos = snapInfo.position;
       }
 
       e.preventDefault();
 
-      if (isSameFeatureVertex && cds.newVertices.length > 0) {
-        // Clicking on an existing vertex of the same feature → finish drawing.
-        // The new vertices already placed will be inserted; we don't add the
-        // clicked vertex since it already exists in the geometry.
-        onFinishRef.current();
+      // Check if this should finish drawing:
+      // - Clicking on a vertex or edge of an existing polygon (when we already have vertices)
+      if (cds.newVertices.length > 0 && snapInfo.snapType !== "none") {
+        // Finish drawing by connecting to this snap target
+        if (snapInfo.snapType === "vertex" && snapInfo.vertexInfo) {
+          onFinishRef.current("vertex", snapInfo.vertexInfo, null);
+        } else if (snapInfo.snapType === "edge" && snapInfo.edgeInfo) {
+          onFinishRef.current("edge", null, snapInfo.edgeInfo);
+        } else {
+          // Add as normal vertex
+          onAddVertexRef.current(pos);
+        }
       } else {
         // Normal: add a new vertex
         onAddVertexRef.current(pos);
@@ -537,10 +633,15 @@ export function useContinueDrawing({
       if (!isActiveRef.current) return;
       e.preventDefault();
 
-      // The last click of the double-click already handled via handleClick.
-      // If it was a snap-to-finish click, onFinish was already called.
-      // If it was a normal vertex add, we finish now.
-      onFinishRef.current();
+      const cds = cdsRef.current;
+      if (!cds || cds.newVertices.length === 0) {
+        // No vertices placed — just cancel
+        onCancelRef.current();
+        return;
+      }
+
+      // Finish drawing in free mode (double-click to close)
+      onFinishRef.current("free", null, null);
     };
 
     map.on("mousemove", handleMouseMove);
@@ -577,7 +678,12 @@ export function useContinueDrawing({
 
       if (e.key === "Enter") {
         e.preventDefault();
-        onFinishRef.current();
+        const cds = cdsRef.current;
+        if (cds && cds.newVertices.length > 0) {
+          onFinishRef.current("free", null, null);
+        } else {
+          onCancelRef.current();
+        }
         return;
       }
 
@@ -601,4 +707,59 @@ export function useContinueDrawing({
     isActive,
     cleanup,
   };
+}
+
+// ─── Helpers ────────────────────────────────────────────────
+
+/**
+ * Get the coordinates [start, end] of a specific edge in a feature.
+ */
+function getEdgeCoordinates(
+  feature: import("../types").ParkFeature,
+  edgeInfo: EdgeAnchorInfo,
+): Position[] | null {
+  const geom = feature.geometry;
+
+  switch (geom.type) {
+    case "LineString": {
+      const coords = geom.coordinates;
+      const i = edgeInfo.edgeStartIndex;
+      if (i >= 0 && i < coords.length - 1) {
+        return [coords[i], coords[i + 1]];
+      }
+      break;
+    }
+    case "MultiLineString": {
+      if (edgeInfo.partIndex === null) break;
+      const part = geom.coordinates[edgeInfo.partIndex];
+      if (!part) break;
+      const i = edgeInfo.edgeStartIndex;
+      if (i >= 0 && i < part.length - 1) {
+        return [part[i], part[i + 1]];
+      }
+      break;
+    }
+    case "Polygon": {
+      const ring = geom.coordinates[edgeInfo.ringIndex];
+      if (!ring) break;
+      const i = edgeInfo.edgeStartIndex;
+      if (i >= 0 && i < ring.length - 1) {
+        return [ring[i], ring[i + 1]];
+      }
+      break;
+    }
+    case "MultiPolygon": {
+      if (edgeInfo.partIndex === null) break;
+      const part = geom.coordinates[edgeInfo.partIndex];
+      if (!part) break;
+      const ring = part[edgeInfo.ringIndex];
+      if (!ring) break;
+      const i = edgeInfo.edgeStartIndex;
+      if (i >= 0 && i < ring.length - 1) {
+        return [ring[i], ring[i + 1]];
+      }
+      break;
+    }
+  }
+  return null;
 }

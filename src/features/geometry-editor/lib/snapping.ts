@@ -12,6 +12,18 @@ export interface SnapResult {
   featureId?: string;
 }
 
+/** Extended snap result that includes edge information for edge splitting. */
+export interface EdgeSnapResult extends SnapResult {
+  /** The index of the ring (0 for outer ring, 1+ for holes). Relevant for polygons. */
+  ringIndex?: number;
+  /** The index of the first vertex of the snapped edge. */
+  edgeStartIndex?: number;
+  /** For MultiPolygon/MultiLineString: which part. */
+  partIndex?: number;
+  /** Parametric t value along the edge (0 = start vertex, 1 = end vertex). */
+  edgeT?: number;
+}
+
 /**
  * Extract all vertices from a ParkFeature.
  */
@@ -35,6 +47,136 @@ function extractVertices(feature: ParkFeature): Position[] {
     default:
       return [];
   }
+}
+
+/**
+ * An edge is a segment between two consecutive vertices.
+ * Includes metadata for locating the edge within the geometry.
+ */
+interface EdgeInfo {
+  start: Position;
+  end: Position;
+  /** For polygons: ring index (0=outer, 1+=holes). For lines: 0. */
+  ringIndex: number;
+  /** Index of the start vertex within the ring/line. */
+  startIndex: number;
+  /** For Multi* types: which part. null for non-multi. */
+  partIndex: number | null;
+}
+
+/**
+ * Extract all edges from a ParkFeature.
+ */
+function extractEdges(feature: ParkFeature): EdgeInfo[] {
+  const geom = feature.geometry;
+  const edges: EdgeInfo[] = [];
+
+  switch (geom.type) {
+    case "LineString": {
+      const coords = geom.coordinates;
+      for (let i = 0; i < coords.length - 1; i++) {
+        edges.push({
+          start: coords[i],
+          end: coords[i + 1],
+          ringIndex: 0,
+          startIndex: i,
+          partIndex: null,
+        });
+      }
+      break;
+    }
+    case "MultiLineString": {
+      const parts = geom.coordinates;
+      for (let p = 0; p < parts.length; p++) {
+        const coords = parts[p];
+        for (let i = 0; i < coords.length - 1; i++) {
+          edges.push({
+            start: coords[i],
+            end: coords[i + 1],
+            ringIndex: 0,
+            startIndex: i,
+            partIndex: p,
+          });
+        }
+      }
+      break;
+    }
+    case "Polygon": {
+      const rings = geom.coordinates;
+      for (let r = 0; r < rings.length; r++) {
+        const ring = rings[r];
+        // Ring is closed: [v0, v1, ..., vN, v0]
+        // Edges: v0-v1, v1-v2, ..., v(N-1)-vN, vN-v0
+        for (let i = 0; i < ring.length - 1; i++) {
+          edges.push({
+            start: ring[i],
+            end: ring[i + 1],
+            ringIndex: r,
+            startIndex: i,
+            partIndex: null,
+          });
+        }
+      }
+      break;
+    }
+    case "MultiPolygon": {
+      const parts = geom.coordinates;
+      for (let p = 0; p < parts.length; p++) {
+        const rings = parts[p];
+        for (let r = 0; r < rings.length; r++) {
+          const ring = rings[r];
+          for (let i = 0; i < ring.length - 1; i++) {
+            edges.push({
+              start: ring[i],
+              end: ring[i + 1],
+              ringIndex: r,
+              startIndex: i,
+              partIndex: p,
+            });
+          }
+        }
+      }
+      break;
+    }
+    default:
+      break;
+  }
+
+  return edges;
+}
+
+/**
+ * Project a point onto a line segment in screen space and return the
+ * parametric t value and the distance in pixels.
+ *
+ * t=0 is the start of the segment, t=1 is the end. The projected point
+ * is clamped to [0, 1].
+ */
+function projectOntoSegmentScreen(
+  cursor: { x: number; y: number },
+  segStart: { x: number; y: number },
+  segEnd: { x: number; y: number },
+): { t: number; distPx: number; projX: number; projY: number } {
+  const dx = segEnd.x - segStart.x;
+  const dy = segEnd.y - segStart.y;
+  const lenSq = dx * dx + dy * dy;
+
+  if (lenSq === 0) {
+    // Degenerate segment (zero length)
+    const ex = cursor.x - segStart.x;
+    const ey = cursor.y - segStart.y;
+    return { t: 0, distPx: Math.sqrt(ex * ex + ey * ey), projX: segStart.x, projY: segStart.y };
+  }
+
+  let t = ((cursor.x - segStart.x) * dx + (cursor.y - segStart.y) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+
+  const projX = segStart.x + t * dx;
+  const projY = segStart.y + t * dy;
+  const ex = cursor.x - projX;
+  const ey = cursor.y - projY;
+
+  return { t, distPx: Math.sqrt(ex * ex + ey * ey), projX, projY };
 }
 
 /**
@@ -92,49 +234,79 @@ export function findNearestVertex(
 }
 
 /**
- * Find the nearest point on any edge within threshold.
- * Useful for edge snapping (future extension).
+ * Find the nearest point on any edge within threshold distance (in pixels).
  *
- * TODO: Implement edge snapping for mid-draw vertex placement.
- * This would project the cursor onto the nearest line segment
- * and return the projected point if within threshold.
+ * Projects the cursor onto each line segment in screen space, finds the
+ * nearest projected point, and converts back to geographic coordinates
+ * via linear interpolation along the original segment.
  *
- * @param _point - The cursor position [lng, lat]
- * @param _features - The feature collection to search
- * @param _project - Function to convert lng/lat to screen pixels
- * @param _thresholdPx - Maximum distance in pixels for snapping
- * @returns SnapResult
+ * @param point - The cursor position [lng, lat]
+ * @param features - The feature collection to search
+ * @param project - Function to convert lng/lat to screen pixels
+ * @param thresholdPx - Maximum distance in pixels for snapping
+ * @param excludeFeatureId - Optional feature ID to exclude from snapping
+ * @returns EdgeSnapResult with the nearest edge point or null
  */
 export function findNearestEdge(
-  _point: Position,
-  _features: ParkFeatureCollection,
-  _project: ProjectFn,
-  _thresholdPx: number = 10
-): SnapResult {
-  // TODO: Implement edge snapping
-  // For each line segment in each feature:
-  //   1. Project both endpoints to screen
-  //   2. Find nearest point on the projected segment to cursor
-  //   3. If within threshold, convert back to geographic coords
-  //   4. Return the nearest result
-  return {
+  point: Position,
+  features: ParkFeatureCollection,
+  project: ProjectFn,
+  thresholdPx: number = 10,
+  excludeFeatureId?: string
+): EdgeSnapResult {
+  const cursorScreen = project([point[0], point[1]]);
+  let nearest: EdgeSnapResult = {
     snapped: null,
-    original: _point,
+    original: point,
     distancePx: Infinity,
   };
+
+  for (const feature of features.features) {
+    if (feature.id === excludeFeatureId) continue;
+
+    const edges = extractEdges(feature);
+    for (const edge of edges) {
+      const startScreen = project([edge.start[0], edge.start[1]]);
+      const endScreen = project([edge.end[0], edge.end[1]]);
+
+      const result = projectOntoSegmentScreen(cursorScreen, startScreen, endScreen);
+
+      if (result.distPx < nearest.distancePx && result.distPx <= thresholdPx) {
+        // Interpolate back to geographic coordinates
+        const snappedLng = edge.start[0] + result.t * (edge.end[0] - edge.start[0]);
+        const snappedLat = edge.start[1] + result.t * (edge.end[1] - edge.start[1]);
+
+        nearest = {
+          snapped: [snappedLng, snappedLat],
+          original: point,
+          distancePx: result.distPx,
+          featureId: feature.id,
+          ringIndex: edge.ringIndex,
+          edgeStartIndex: edge.startIndex,
+          partIndex: edge.partIndex ?? undefined,
+          edgeT: result.t,
+        };
+      }
+    }
+  }
+
+  return nearest;
 }
 
 /**
  * Combined snapping: tries vertex snap first, then edge snap.
- * Returns the best result (closest).
+ * Vertex snap is preferred when distances are close (within vertexPriorityPx).
+ *
+ * Returns a union type — callers can check for edge-specific fields.
  */
 export function snapPoint(
   point: Position,
   features: ParkFeatureCollection,
   project: ProjectFn,
   thresholdPx: number = 10,
-  excludeFeatureId?: string
-): SnapResult {
+  excludeFeatureId?: string,
+  vertexPriorityPx: number = 3,
+): EdgeSnapResult {
   const vertexSnap = findNearestVertex(
     point,
     features,
@@ -143,9 +315,44 @@ export function snapPoint(
     excludeFeatureId
   );
 
-  // TODO: When edge snapping is implemented, compare distances
-  // const edgeSnap = findNearestEdge(point, features, project, thresholdPx);
-  // return vertexSnap.distancePx <= edgeSnap.distancePx ? vertexSnap : edgeSnap;
+  const edgeSnap = findNearestEdge(
+    point,
+    features,
+    project,
+    thresholdPx,
+    excludeFeatureId
+  );
 
-  return vertexSnap;
+  // If vertex snap found, prefer it unless edge snap is significantly closer
+  if (vertexSnap.snapped && edgeSnap.snapped) {
+    // Vertex gets priority if within vertexPriorityPx of the edge distance
+    if (vertexSnap.distancePx <= edgeSnap.distancePx + vertexPriorityPx) {
+      return {
+        snapped: vertexSnap.snapped,
+        original: vertexSnap.original,
+        distancePx: vertexSnap.distancePx,
+        featureId: vertexSnap.featureId,
+        // No edge-specific fields → this is a vertex snap
+      };
+    }
+    return edgeSnap;
+  }
+
+  if (vertexSnap.snapped) {
+    return {
+      snapped: vertexSnap.snapped,
+      original: vertexSnap.original,
+      distancePx: vertexSnap.distancePx,
+      featureId: vertexSnap.featureId,
+    };
+  }
+
+  return edgeSnap;
+}
+
+/**
+ * Check if a snap result is an edge snap (has edge-specific metadata).
+ */
+export function isEdgeSnap(snap: EdgeSnapResult): boolean {
+  return snap.edgeStartIndex !== undefined && snap.edgeT !== undefined;
 }

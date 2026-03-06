@@ -18,6 +18,8 @@ import {
   SELECTED_FILL_LAYER,
   SELECTED_OUTLINE_LAYER,
   SELECTED_POINT_LAYER,
+  FACILITY_POINT_LAYER,
+  SELECTED_FACILITY_POINT_LAYER,
   MEASUREMENT_SOURCE_ID,
   MEASUREMENT_LINE_LAYER,
   MEASUREMENT_FILL_LAYER,
@@ -27,6 +29,12 @@ import {
   MULTI_DRAW_LINE_LAYER,
   MULTI_DRAW_POINT_LAYER,
   LAYER_CONFIG,
+  SELECTED_PARTS_SOURCE_ID,
+  SELECTED_PARTS_FILL_LAYER,
+  SELECTED_PARTS_OUTLINE_LAYER,
+  PARK_BACKGROUND_SOURCE_ID,
+  PARK_BACKGROUND_FILL_LAYER,
+  PARK_BACKGROUND_OUTLINE_LAYER,
 } from "../constants";
 import type {
   ParkFeatureCollection,
@@ -34,6 +42,7 @@ import type {
   ToolMode,
   MeasurementState,
   ParkLayer,
+  EditorMode,
 } from "../types";
 import { useMapDraw } from "../hooks/use-map-draw";
 import { useVertexEdit } from "../hooks/use-vertex-edit";
@@ -43,11 +52,94 @@ import {
   VERTEX_EDIT_VERTEX_LAYER,
   VERTEX_EDIT_SELECTED_VERTEX_LAYER,
   VERTEX_EDIT_MIDPOINT_LAYER,
+  SNAP_THRESHOLD_PX,
 } from "../constants";
 import { clipPolygon } from "../lib/geometry-ops";
+import { findNearestVertex, findNearestEdge, type ProjectFn } from "../lib/snapping";
+import type { VertexAnchorInfo, EdgeAnchorInfo } from "../types";
 import type { Feature, LineString, Polygon as GeoPolygon, Position } from "geojson";
 import { toast } from "sonner";
 import { booleanPointInPolygon, point as turfPoint, polygon as turfPolygon } from "@turf/turf";
+
+// ─── Find vertex info in a feature collection ──────────────────
+/**
+ * Given a snapped position and (optionally) the feature ID it snapped to,
+ * find the full VertexAnchorInfo (partIndex, ringIndex, vertexIndex).
+ */
+function findVertexInfoInCollection(
+  collection: ParkFeatureCollection,
+  position: Position,
+  featureId?: string,
+): VertexAnchorInfo | null {
+  const match = (v: Position) => v[0] === position[0] && v[1] === position[1];
+
+  const searchFeature = (f: ParkFeature): VertexAnchorInfo | null => {
+    const geom = f.geometry;
+    switch (geom.type) {
+      case "Point":
+        if (match(geom.coordinates)) {
+          return { featureId: f.id, partIndex: null, ringIndex: 0, vertexIndex: 0, position };
+        }
+        break;
+      case "LineString":
+        for (let i = 0; i < geom.coordinates.length; i++) {
+          if (match(geom.coordinates[i])) {
+            return { featureId: f.id, partIndex: null, ringIndex: 0, vertexIndex: i, position };
+          }
+        }
+        break;
+      case "MultiLineString":
+        for (let p = 0; p < geom.coordinates.length; p++) {
+          for (let i = 0; i < geom.coordinates[p].length; i++) {
+            if (match(geom.coordinates[p][i])) {
+              return { featureId: f.id, partIndex: p, ringIndex: 0, vertexIndex: i, position };
+            }
+          }
+        }
+        break;
+      case "Polygon":
+        for (let r = 0; r < geom.coordinates.length; r++) {
+          const ring = geom.coordinates[r];
+          for (let i = 0; i < ring.length - 1; i++) {
+            if (match(ring[i])) {
+              return { featureId: f.id, partIndex: null, ringIndex: r, vertexIndex: i, position };
+            }
+          }
+        }
+        break;
+      case "MultiPolygon":
+        for (let p = 0; p < geom.coordinates.length; p++) {
+          for (let r = 0; r < geom.coordinates[p].length; r++) {
+            const ring = geom.coordinates[p][r];
+            for (let i = 0; i < ring.length - 1; i++) {
+              if (match(ring[i])) {
+                return { featureId: f.id, partIndex: p, ringIndex: r, vertexIndex: i, position };
+              }
+            }
+          }
+        }
+        break;
+    }
+    return null;
+  };
+
+  // If we know the feature ID, search that feature first
+  if (featureId) {
+    const feat = collection.features.find((f) => f.id === featureId);
+    if (feat) {
+      const result = searchFeature(feat);
+      if (result) return result;
+    }
+  }
+
+  // Fall back to searching all features
+  for (const feat of collection.features) {
+    const result = searchFeature(feat);
+    if (result) return result;
+  }
+
+  return null;
+}
 
 // ─── Point-to-segment distance (for MultiLineString part detection) ──
 /** Approximate squared distance from a point to a line segment in lng/lat space. */
@@ -109,6 +201,48 @@ function translateFeatureGeometry(
   };
 }
 
+// ─── Facility pin marker SVG helpers ─────────────────────────
+// Creates a teardrop/pin marker SVG as an HTMLImageElement for use with map.addImage()
+function createPinMarkerImage(
+  outerColor: string,
+  innerColor: string,
+  size: number = 48
+): Promise<HTMLImageElement> {
+  // The pin shape: a teardrop pointing downward
+  // Viewbox is 40x52 — a circle at top with a pointed tail at bottom
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${size}" height="${Math.round(size * 1.3)}" viewBox="0 0 40 52">
+    <path d="M20 50 C20 50 2 30 2 18 C2 8.06 10.06 0 20 0 C29.94 0 38 8.06 38 18 C38 30 20 50 20 50Z" fill="${outerColor}" stroke="none"/>
+    <circle cx="20" cy="18" r="12" fill="${innerColor}"/>
+  </svg>`;
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
+  });
+}
+
+// Load facility pin marker images into the map
+async function loadFacilityPinImages(map: MaplibreMap) {
+  try {
+    const [defaultPin, selectedPin] = await Promise.all([
+      // Default: white outer, dark green inner (matches screenshot 1)
+      createPinMarkerImage("#ffffff", "#2f6846", 64),
+      // Selected: blue outer, white inner (matches screenshot 2)
+      createPinMarkerImage("#4a8af4", "#ffffff", 64),
+    ]);
+
+    if (!map.hasImage("facility-pin-default")) {
+      map.addImage("facility-pin-default", defaultPin, { pixelRatio: 2 });
+    }
+    if (!map.hasImage("facility-pin-selected")) {
+      map.addImage("facility-pin-selected", selectedPin, { pixelRatio: 2 });
+    }
+  } catch (e) {
+    console.error("Failed to load facility pin images:", e);
+  }
+}
+
 interface MapEditorProps {
   features: ParkFeatureCollection;
   visibleFeatures: ParkFeatureCollection;
@@ -121,6 +255,14 @@ interface MapEditorProps {
   splitTargetId?: string | null;
   /** Ref that MapEditor populates with a getter for the selected vertex in vertex edit mode. */
   getSelectedVertexRef?: React.MutableRefObject<(() => { ringIndex: number; vertexIndex: number } | null) | null>;
+  /** Tools allowed in the current editor mode, used to gate keyboard shortcuts. */
+  allowedTools?: ToolMode[];
+  /** Current editor mode – determines default layer and behavior. */
+  editorMode?: EditorMode;
+  /** Fly-to callback for the F keyboard shortcut. */
+  onFlyTo?: () => void;
+  /** Non-editable park boundary shown as background context (facility mode). */
+  backgroundParkBoundary?: ParkFeatureCollection;
 }
 
 export function MapEditor({
@@ -134,7 +276,16 @@ export function MapEditor({
   onMapReady,
   splitTargetId,
   getSelectedVertexRef,
+  allowedTools,
+  editorMode,
+  onFlyTo,
+  backgroundParkBoundary,
 }: MapEditorProps) {
+  // Derive mode-specific flags and default layer from editorMode
+  const isParkMode = editorMode === "park";
+  const isFacilityMode = editorMode === "facility";
+  const defaultLayer: ParkLayer = editorMode === "facility" ? "facilities" : editorMode === "park" ? "park" : "draft";
+
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MaplibreMap | null>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
@@ -254,36 +405,23 @@ export function MapEditor({
         return;
       }
 
-      // ── Multi-part drawing: Polygon ──
-      if (activeToolRef.current === "draw_polygon" && feature.geometry.type === "Polygon") {
-        const polyCoords = (feature.geometry as GeoPolygon).coordinates;
-        editor.appendDrawingPart("polygon", polyCoords);
-        // Briefly switch to select so MapboxDraw goes to simple_select,
-        // preventing the double-click from bleeding into the next draw.
-        // Then re-enter draw mode after the double-click event has settled.
-        editor.setTool("select");
-        setTimeout(() => {
-          editor.setTool("draw_polygon");
-        }, 300);
-        toast.info("パートを追加しました", {
-          description: "続けて次のポリゴンを描画、または Enter / 完了ボタンで確定",
-          duration: 2000,
-        });
-        return;
-      }
+      // Note: draw_polygon is now handled by the custom drawing system
+      // (use-continue-drawing.ts), not by MapboxDraw. The polygon creation
+      // path above has been removed.
 
       // ── Single-part creation (Point or other) ──
       editor.addFeature(feature);
       editor.selectFeatures([feature.id]);
       editor.setRightPanel(true);
 
-      // Keep point tool active for continuous placement;
-      // MapboxDraw re-entry is handled in use-map-draw.ts
-      if (activeToolRef.current !== "draw_point") {
+      // In facility mode, switch to select after placing a point
+      // (only one point allowed per facility).
+      // In other modes, keep point tool active for continuous placement.
+      if (isFacilityMode || activeToolRef.current !== "draw_point") {
         editor.setTool("select");
       }
     },
-    [editor, features.features]
+    [editor, features.features, isParkMode, isFacilityMode]
   );
 
   const handleFeatureUpdated = useCallback(
@@ -315,7 +453,7 @@ export function MapEditor({
     onSelectionChanged: handleSelectionChanged,
     onDrawingStateChanged: handleDrawingStateChanged,
     getExistingFeature,
-    defaultLayer: "draft",
+    defaultLayer,
   });
 
   // ─── Vertex edit integration ────────────────────────────────
@@ -343,18 +481,11 @@ export function MapEditor({
     }
   }, [getSelectedVertex, getSelectedVertexRef]);
 
-  // ─── Continue drawing integration ─────────────────────────
-  const continueDrawingFeature = useMemo(() => {
-    const cds = editor.state.continueDrawingState;
-    if (!cds) return null;
-    return features.features.find((f) => f.id === cds.featureId) ?? null;
-  }, [editor.state.continueDrawingState, features.features]);
-
+  // ─── Continue drawing integration (custom polygon drawing) ──
   useContinueDrawing({
     map: mapRef.current,
     mapLoaded,
     continueDrawingState: editor.state.continueDrawingState,
-    feature: continueDrawingFeature,
     allFeatures: features,
     snappingEnabled,
     onAddVertex: editor.addContinueVertex,
@@ -367,6 +498,35 @@ export function MapEditor({
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapLoaded) return;
+
+    // Add park background source and layers (facility mode context, rendered underneath)
+    if (!map.getSource(PARK_BACKGROUND_SOURCE_ID)) {
+      map.addSource(PARK_BACKGROUND_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+
+      map.addLayer({
+        id: PARK_BACKGROUND_FILL_LAYER,
+        type: "fill",
+        source: PARK_BACKGROUND_SOURCE_ID,
+        paint: {
+          "fill-color": LAYER_CONFIG.park.color,
+          "fill-opacity": 0.12,
+        },
+      });
+
+      map.addLayer({
+        id: PARK_BACKGROUND_OUTLINE_LAYER,
+        type: "line",
+        source: PARK_BACKGROUND_SOURCE_ID,
+        paint: {
+          "line-color": LAYER_CONFIG.park.color,
+          "line-width": 2,
+          "line-dasharray": [4, 3],
+        },
+      });
+    }
 
     // Add main features source
     if (!map.getSource(SOURCE_ID)) {
@@ -438,7 +598,7 @@ export function MapEditor({
         },
       });
 
-      // Point layer (non-text)
+      // Point layer (non-text, non-facility)
       map.addLayer({
         id: POINT_LAYER,
         type: "circle",
@@ -447,6 +607,7 @@ export function MapEditor({
           "all",
           ["==", ["geometry-type"], "Point"],
           ["!=", ["get", "type"], "text"],
+          ["!=", ["get", "layer"], "facilities"],
         ],
         paint: {
           "circle-radius": ["coalesce", ["get", "size"], 8],
@@ -454,7 +615,6 @@ export function MapEditor({
             "match",
             ["get", "layer"],
             "park", LAYER_CONFIG.park.color,
-            "facilities", LAYER_CONFIG.facilities.color,
             "draft", LAYER_CONFIG.draft.color,
             LAYER_CONFIG.draft.color,
           ],
@@ -463,7 +623,30 @@ export function MapEditor({
         },
       });
 
-      // Text layer - show labels for point features that have a label
+      // Facility point layer (pin marker icon)
+      loadFacilityPinImages(map).then(() => {
+        if (!map.getLayer(FACILITY_POINT_LAYER)) {
+          map.addLayer({
+            id: FACILITY_POINT_LAYER,
+            type: "symbol",
+            source: SOURCE_ID,
+            filter: [
+              "all",
+              ["==", ["geometry-type"], "Point"],
+              ["!=", ["get", "type"], "text"],
+              ["==", ["get", "layer"], "facilities"],
+            ],
+            layout: {
+              "icon-image": "facility-pin-default",
+              "icon-size": 1.0,
+              "icon-anchor": "bottom",
+              "icon-allow-overlap": true,
+            },
+          });
+        }
+      });
+
+      // Text layer - show labels for point features that have a label (excluding facility points)
       map.addLayer({
         id: TEXT_LAYER,
         type: "symbol",
@@ -473,6 +656,7 @@ export function MapEditor({
           ["==", ["geometry-type"], "Point"],
           ["has", "label"],
           ["!=", ["get", "label"], ""],
+          ["!=", ["get", "layer"], "facilities"],
         ],
         layout: {
           "text-field": ["get", "label"],
@@ -580,13 +764,36 @@ export function MapEditor({
         id: SELECTED_POINT_LAYER,
         type: "circle",
         source: SOURCE_ID,
-        filter: ["==", ["get", "id"], ""],
+        filter: [
+          "all",
+          ["==", ["get", "id"], ""],
+          ["!=", ["get", "layer"], "facilities"],
+        ],
         paint: {
           "circle-radius": 10,
           "circle-color": "#3d6b4f",
           "circle-stroke-width": 3,
           "circle-stroke-color": "#ffffff",
         },
+      });
+
+      // Selected facility point layer (pin marker icon - selected state)
+      // This layer will be activated after facility pin images are loaded
+      loadFacilityPinImages(map).then(() => {
+        if (!map.getLayer(SELECTED_FACILITY_POINT_LAYER)) {
+          map.addLayer({
+            id: SELECTED_FACILITY_POINT_LAYER,
+            type: "symbol",
+            source: SOURCE_ID,
+            filter: ["==", ["get", "id"], ""],
+            layout: {
+              "icon-image": "facility-pin-selected",
+              "icon-size": 1.15,
+              "icon-anchor": "bottom",
+              "icon-allow-overlap": true,
+            },
+          });
+        }
       });
     }
 
@@ -678,6 +885,34 @@ export function MapEditor({
         },
       });
     }
+
+    // Add selected parts source and layers (park mode part selection)
+    if (!map.getSource(SELECTED_PARTS_SOURCE_ID)) {
+      map.addSource(SELECTED_PARTS_SOURCE_ID, {
+        type: "geojson",
+        data: { type: "FeatureCollection", features: [] },
+      });
+
+      map.addLayer({
+        id: SELECTED_PARTS_FILL_LAYER,
+        type: "fill",
+        source: SELECTED_PARTS_SOURCE_ID,
+        paint: {
+          "fill-color": "#f59e0b",
+          "fill-opacity": 0.45,
+        },
+      });
+
+      map.addLayer({
+        id: SELECTED_PARTS_OUTLINE_LAYER,
+        type: "line",
+        source: SELECTED_PARTS_SOURCE_ID,
+        paint: {
+          "line-color": "#d97706",
+          "line-width": 3,
+        },
+      });
+    }
   }, [mapLoaded]);
 
   // ─── Update GeoJSON data when features change ─────────────
@@ -700,25 +935,134 @@ export function MapEditor({
     }
   }, [visibleFeatures, mapLoaded]);
 
-  // ─── Update selection highlight ───────────────────────────
+  // ─── Update park background data (facility mode context) ──
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapLoaded) return;
 
+    const source = map.getSource(PARK_BACKGROUND_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    if (source) {
+      if (backgroundParkBoundary && backgroundParkBoundary.features.length > 0) {
+        const data: GeoJSON.FeatureCollection = {
+          type: "FeatureCollection",
+          features: backgroundParkBoundary.features.map((f) => ({
+            type: "Feature" as const,
+            geometry: f.geometry,
+            properties: { ...f.properties },
+          })),
+        };
+        source.setData(data);
+      } else {
+        source.setData({ type: "FeatureCollection", features: [] });
+      }
+    }
+  }, [backgroundParkBoundary, mapLoaded]);
+
+  // ─── Update selection highlight ───────────────────────────
+  const selectedPartIndices = editor.state.selectedPartIndices;
+
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapLoaded) return;
+
+    // When parts are selected, suppress the default feature-level highlight
+    // so that only the part-level highlight is shown.
+    const hasPartSelection = selectedPartIndices.length > 0;
+
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const filter: any =
-      selectedFeatureIds.length > 0
+      selectedFeatureIds.length > 0 && !hasPartSelection
         ? ["in", ["get", "id"], ["literal", selectedFeatureIds]]
         : ["==", ["get", "id"], ""];
+
+    // Exclude facility points from the circle-based selected point layer
+    // (facility points use their own pin-marker selected layer instead).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const selectedPointFilter: any =
+      selectedFeatureIds.length > 0 && !hasPartSelection
+        ? [
+            "all",
+            ["in", ["get", "id"], ["literal", selectedFeatureIds]],
+            ["!=", ["get", "layer"], "facilities"],
+          ]
+        : ["==", ["get", "id"], ""];
+
+    // Build a facility-only filter for the selected facility pin layer
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const facilityFilter: any =
+      selectedFeatureIds.length > 0 && !hasPartSelection
+        ? [
+            "all",
+            ["in", ["get", "id"], ["literal", selectedFeatureIds]],
+            ["==", ["get", "layer"], "facilities"],
+          ]
+        : ["==", ["get", "id"], ""];
+
+    // Hide the default facility pin for selected features so only the
+    // selected pin is visible (prevents the default pin peeking through).
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const facilityDefaultFilter: any =
+      selectedFeatureIds.length > 0 && !hasPartSelection
+        ? [
+            "all",
+            ["==", ["geometry-type"], "Point"],
+            ["!=", ["get", "type"], "text"],
+            ["==", ["get", "layer"], "facilities"],
+            ["!", ["in", ["get", "id"], ["literal", selectedFeatureIds]]],
+          ]
+        : [
+            "all",
+            ["==", ["geometry-type"], "Point"],
+            ["!=", ["get", "type"], "text"],
+            ["==", ["get", "layer"], "facilities"],
+          ];
 
     try {
       map.setFilter(SELECTED_FILL_LAYER, filter);
       map.setFilter(SELECTED_OUTLINE_LAYER, filter);
-      map.setFilter(SELECTED_POINT_LAYER, filter);
+      map.setFilter(SELECTED_POINT_LAYER, selectedPointFilter);
+      if (map.getLayer(SELECTED_FACILITY_POINT_LAYER)) {
+        map.setFilter(SELECTED_FACILITY_POINT_LAYER, facilityFilter);
+      }
+      if (map.getLayer(FACILITY_POINT_LAYER)) {
+        map.setFilter(FACILITY_POINT_LAYER, facilityDefaultFilter);
+      }
     } catch {
       // Layers may not exist yet
     }
-  }, [selectedFeatureIds, mapLoaded]);
+  }, [selectedFeatureIds, selectedPartIndices, mapLoaded]);
+
+  // ─── Update selected parts highlight (park mode) ──────────
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapLoaded) return;
+
+    const source = map.getSource(SELECTED_PARTS_SOURCE_ID) as maplibregl.GeoJSONSource | undefined;
+    if (!source) return;
+
+    if (selectedPartIndices.length === 0 || selectedFeatureIds.length !== 1) {
+      source.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+
+    const featureId = selectedFeatureIds[0];
+    const feature = features.features.find((f) => f.id === featureId);
+    if (!feature || feature.geometry.type !== "MultiPolygon") {
+      source.setData({ type: "FeatureCollection", features: [] });
+      return;
+    }
+
+    const allParts = (feature.geometry as import("geojson").MultiPolygon).coordinates;
+    const partFeatures: GeoJSON.Feature[] = selectedPartIndices
+      .filter((i) => i >= 0 && i < allParts.length)
+      .map((i) => ({
+        type: "Feature" as const,
+        geometry: { type: "Polygon" as const, coordinates: allParts[i] },
+        properties: { partIndex: i },
+      }));
+
+    source.setData({ type: "FeatureCollection", features: partFeatures });
+  }, [selectedPartIndices, selectedFeatureIds, features, mapLoaded]);
 
   // ─── Update measurement visualization ─────────────────────
   useEffect(() => {
@@ -866,6 +1210,53 @@ export function MapEditor({
 
       const lngLat: [number, number] = [e.lngLat.lng, e.lngLat.lat];
 
+      // ── draw_polygon first click: start custom drawing session ──
+      if (activeTool === "draw_polygon" && !editor.state.continueDrawingState) {
+        e.preventDefault();
+        const cursorPos: Position = [lngLat[0], lngLat[1]];
+        const allFeats = visibleFeatures; // ParkFeatureCollection prop
+
+        if (snappingEnabled && map) {
+          const project: ProjectFn = (pos) => {
+            const p = map.project(pos);
+            return { x: p.x, y: p.y };
+          };
+
+          // Try vertex snap first (with priority)
+          const vertexResult = findNearestVertex(cursorPos, allFeats, project, SNAP_THRESHOLD_PX);
+          const edgeResult = findNearestEdge(cursorPos, allFeats, project, SNAP_THRESHOLD_PX);
+
+          const VERTEX_PRIORITY_PX = 3;
+
+          if (vertexResult.snapped && (!edgeResult.snapped || vertexResult.distancePx <= edgeResult.distancePx + VERTEX_PRIORITY_PX)) {
+            // Snapped to vertex — find full vertex info
+            const vertexInfo = findVertexInfoInCollection(allFeats, vertexResult.snapped, vertexResult.featureId);
+            if (vertexInfo) {
+              editor.startContinueDrawing("vertex", vertexInfo, null, null);
+              return;
+            }
+          }
+
+          if (edgeResult.snapped && edgeResult.featureId && edgeResult.edgeStartIndex !== undefined && edgeResult.edgeT !== undefined) {
+            // Snapped to edge
+            const edgeInfo: EdgeAnchorInfo = {
+              featureId: edgeResult.featureId,
+              partIndex: edgeResult.partIndex ?? null,
+              ringIndex: edgeResult.ringIndex ?? 0,
+              edgeStartIndex: edgeResult.edgeStartIndex,
+              position: edgeResult.snapped,
+              edgeT: edgeResult.edgeT,
+            };
+            editor.startContinueDrawing("edge", null, edgeInfo, null);
+            return;
+          }
+        }
+
+        // No snap — start from empty space
+        editor.startContinueDrawing("free", null, null, cursorPos);
+        return;
+      }
+
       // Handle measurement clicks
       if (
         activeTool === "measure_distance" ||
@@ -911,8 +1302,10 @@ export function MapEditor({
           POLYGON_FILL_LAYER,
           LINE_LAYER,
           POINT_LAYER,
+          FACILITY_POINT_LAYER,
+          SELECTED_FACILITY_POINT_LAYER,
           TEXT_LAYER,
-        ];
+        ].filter((id) => { try { return !!map.getLayer(id); } catch { return false; } });
         const hitFeatures = map.queryRenderedFeatures(e.point, {
           layers: queryLayers,
         });
@@ -938,6 +1331,45 @@ export function MapEditor({
         return;
       }
 
+      // Merge parts mode: click to toggle parts
+      if (activeTool === "merge_parts") {
+        const queryLayers = [POLYGON_FILL_LAYER];
+        const hitFeatures = map.queryRenderedFeatures(e.point, { layers: queryLayers });
+        if (hitFeatures.length > 0) {
+          const featureId = hitFeatures[0].properties?.id;
+          if (featureId) {
+            const parkFeature = visibleFeatures.features.find((f) => f.id === featureId);
+            if (parkFeature && parkFeature.geometry.type === "MultiPolygon") {
+              const clickPoint = turfPoint([e.lngLat.lng, e.lngLat.lat]);
+              const parts = parkFeature.geometry.coordinates as Position[][][];
+              let clickedPartIndex = -1;
+              for (let i = 0; i < parts.length; i++) {
+                try {
+                  const poly = turfPolygon(parts[i]);
+                  if (booleanPointInPolygon(clickPoint, poly)) {
+                    clickedPartIndex = i;
+                    break;
+                  }
+                } catch {
+                  // Invalid polygon part, skip
+                }
+              }
+              if (clickedPartIndex >= 0) {
+                const currentParts = [...editor.state.selectedPartIndices];
+                const pidx = currentParts.indexOf(clickedPartIndex);
+                if (pidx >= 0) {
+                  currentParts.splice(pidx, 1);
+                } else {
+                  currentParts.push(clickedPartIndex);
+                }
+                editor.selectParts(featureId, currentParts);
+              }
+            }
+          }
+        }
+        return;
+      }
+
       // Feature selection (only in select mode)
       if (activeTool !== "select") return;
 
@@ -945,8 +1377,10 @@ export function MapEditor({
         POLYGON_FILL_LAYER,
         LINE_LAYER,
         POINT_LAYER,
+        FACILITY_POINT_LAYER,
+        SELECTED_FACILITY_POINT_LAYER,
         TEXT_LAYER,
-      ];
+      ].filter((id) => { try { return !!map.getLayer(id); } catch { return false; } });
 
       const features = map.queryRenderedFeatures(e.point, {
         layers: queryLayers,
@@ -984,6 +1418,10 @@ export function MapEditor({
     activeTool,
     selectedFeatureIds,
     editor,
+    isParkMode,
+    visibleFeatures,
+    snappingEnabled,
+    features,
   ]);
 
   // ─── Double-click handler for vertex edit ───────────────────
@@ -1087,6 +1525,9 @@ export function MapEditor({
       case "continue_drawing":
         canvas.style.cursor = "crosshair";
         break;
+      case "merge_parts":
+        canvas.style.cursor = "pointer";
+        break;
       default:
         canvas.style.cursor = "";
         break;
@@ -1119,8 +1560,10 @@ export function MapEditor({
       POLYGON_FILL_LAYER,
       LINE_LAYER,
       POINT_LAYER,
+      FACILITY_POINT_LAYER,
+      SELECTED_FACILITY_POINT_LAYER,
       TEXT_LAYER,
-    ];
+    ].filter((id) => { try { return !!map.getLayer(id); } catch { return false; } });
 
     const handleMouseDown = (e: maplibregl.MapMouseEvent) => {
       // Only in select mode with a selection (not during vertex edit)
@@ -1274,6 +1717,17 @@ export function MapEditor({
         return;
       }
 
+      // Enter: finish merge parts
+      if (e.key === "Enter" && activeTool === "merge_parts" && editor.state.selectedPartIndices.length >= 2) {
+        e.preventDefault();
+        const featureId = editor.state.selectedFeatureIds[0];
+        if (featureId) {
+          editor.mergeParts(featureId, editor.state.selectedPartIndices);
+          editor.setTool("select");
+        }
+        return;
+      }
+
       // Enter: finish multi-part drawing
       if (e.key === "Enter" && editor.state.drawingParts && editor.state.drawingParts.length > 0) {
         e.preventDefault();
@@ -1281,8 +1735,12 @@ export function MapEditor({
         return;
       }
 
-      // Escape: cancel vertex edit / multi-draw / draw / deselect
+      // Escape: cancel merge parts / vertex edit / multi-draw / draw / deselect
       if (e.key === "Escape") {
+        if (activeTool === "merge_parts") {
+          editor.setTool("select");
+          return;
+        }
         if (editor.state.vertexEditFeatureId) {
           editor.exitVertexEdit();
         } else if (editor.state.drawingParts && editor.state.drawingParts.length > 0) {
@@ -1333,29 +1791,31 @@ export function MapEditor({
       }
 
       // Tool shortcuts (single keys, only when not drawing)
+      // Gated by allowedTools when provided
       if (!editor.state.isDrawing && !e.metaKey && !e.ctrlKey) {
-        switch (e.key.toLowerCase()) {
-          case "v":
-            editor.setTool("select");
-            break;
-          case "h":
-            editor.setTool("pan");
-            break;
-          case "p":
-            editor.setTool("draw_point");
-            break;
-          case "l":
-            editor.setTool("draw_line");
-            break;
-          case "g":
-            editor.setTool("draw_polygon");
-            break;
-          case "m":
-            editor.setTool("measure_distance");
-            break;
-          case "a":
-            editor.setTool("measure_area");
-            break;
+        // Fly-to shortcut
+        if (e.key.toLowerCase() === "f" && onFlyTo) {
+          e.preventDefault();
+          onFlyTo();
+          return;
+        }
+
+        const SHORTCUT_MAP: Record<string, ToolMode> = {
+          v: "select",
+          h: "pan",
+          p: "draw_point",
+          l: "draw_line",
+          g: "draw_polygon",
+          m: "measure_distance",
+          a: "measure_area",
+        };
+
+        const targetTool = SHORTCUT_MAP[e.key.toLowerCase()];
+        if (targetTool) {
+          // Only activate if tool is allowed in current mode (or no filter is set)
+          if (!allowedTools || allowedTools.includes(targetTool)) {
+            editor.setTool(targetTool);
+          }
         }
       }
     };
@@ -1364,9 +1824,12 @@ export function MapEditor({
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     editor,
+    activeTool,
     selectedFeatureIds,
     measurementState,
     trashLastVertex,
+    allowedTools,
+    onFlyTo,
   ]);
 
   return (
